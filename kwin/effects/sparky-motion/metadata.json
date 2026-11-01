@@ -1,0 +1,14 @@
+{
+    "KPackageStructure": "KWin/Effect",
+    "KPlugin": {
+        "Category": "Window Open/Close Animation",
+        "Description": "Sparky's window motion: open, close, minimize into the dock and back",
+        "EnabledByDefault": false,
+        "Id": "sparky-motion",
+        "License": "GPL",
+        "Name": "Sparky Motion"
+    },
+    "X-KDE-Ordering": 60,
+    "X-KWin-Exclusive-Category": "toplevel-open-close-animation",
+    "X-Plasma-API": "javascript"
+}

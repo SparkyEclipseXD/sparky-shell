@@ -1,0 +1,149 @@
+#!/usr/bin/env python3
+import json
+import os
+import subprocess
+import sys
+
+import dbus
+from dbus.mainloop.glib import DBusGMainLoop
+from gi.repository import GLib
+
+COMPONENT = "sparky"
+PATH = os.path.expanduser("~/.config/sparky/binds.json")
+
+MOD = {"Meta": 0x10000000, "Shift": 0x02000000, "Ctrl": 0x04000000, "Alt": 0x08000000}
+KEYS = {
+    "Space": 0x20, "Escape": 0x01000000, "Tab": 0x01000001, "Backspace": 0x01000003,
+    "Return": 0x01000004, "Enter": 0x01000005, "Insert": 0x01000006, "Delete": 0x01000007,
+    "Print": 0x01000009, "Home": 0x01000010, "End": 0x01000011, "Left": 0x01000012,
+    "Up": 0x01000013, "Right": 0x01000014, "Down": 0x01000015, "PgUp": 0x01000016,
+    "PgDown": 0x01000017,
+}
+for n in range(1, 36):
+    KEYS[f"F{n}"] = 0x01000030 + n - 1
+META_TAP = 0x01000022
+
+def parse(seq: str) -> int:
+    code = 0
+    key = 0
+    for part in [p for p in seq.split("+") if p]:
+        if part in MOD:
+            code |= MOD[part]
+        elif part in KEYS:
+            key = KEYS[part]
+        elif len(part) == 1:
+            key = ord(part.upper())
+        else:
+            return 0
+    if key == 0 and code == MOD["Meta"]:
+        return META_TAP
+    return code | key if key else 0
+
+DBusGMainLoop(set_as_default=True)
+bus = dbus.SessionBus()
+accel = dbus.Interface(bus.get_object("org.kde.kglobalaccel", "/kglobalaccel"), "org.kde.KGlobalAccel")
+
+import dbus.service
+
+busname = dbus.service.BusName("org.sparky.Keys", bus, allow_replacement=True,
+                               replace_existing=True, do_not_queue=True)
+bus.add_signal_receiver(lambda name: name == "org.sparky.Keys" and os._exit(0),
+                        "NameLost", "org.freedesktop.DBus")
+
+commands: dict[str, str] = {}
+registered: set[str] = set()
+mtime = 0.0
+
+OLD_META = "org.sparky.Keys,/,org.sparky.Keys,MetaTap"
+_meta = subprocess.run(["kreadconfig6", "--file", "kwinrc", "--group", "ModifierOnlyShortcuts",
+                        "--key", "Meta"], capture_output=True, text=True).stdout.strip()
+if _meta == OLD_META:
+    subprocess.run(["kwriteconfig6", "--file", "kwinrc", "--group", "ModifierOnlyShortcuts",
+                    "--key", "Meta", "--delete"])
+    subprocess.run(["qdbus6", "org.kde.KWin", "/KWin", "reconfigure"], capture_output=True)
+
+def release_conflicts(code, keep=None):
+    for comp in accel.allComponents():
+        c = bus.get_object("org.kde.kglobalaccel", str(comp))
+        for info in c.allShortcutInfos(dbus_interface="org.kde.kglobalaccel.Component"):
+            keys = [int(k) for k in info[6]]
+            if code in keys and str(info[2]) != COMPONENT and \
+                    not (str(info[2]) == "kwin" and str(info[0]) == keep):
+                aid = dbus.Array([str(info[2]), str(info[0]), str(info[3]), str(info[1])], signature="s")
+                rest = dbus.Array(
+                    [dbus.Struct((dbus.Array([dbus.Int32(k)], signature="i"),), signature="ai")
+                     for k in keys if k != code],
+                    signature="(ai)")
+                accel.setForeignShortcutKeys(aid, rest)
+
+def kwin_action(name):
+    return dbus.Array(["kwin", name, "KWin", name], signature="s")
+
+def set_kwin(name, code):
+    codes = [code] if code else []
+    if code and code & ~0x7E000000 == KEYS["Tab"] and code & MOD["Shift"]:
+        codes.append((code & 0x7E000000) | 0x01000002)
+    accel.setForeignShortcutKeys(kwin_action(name), dbus.Array(
+        [dbus.Struct((dbus.Array([dbus.Int32(c)], signature="i"),), signature="ai") for c in codes],
+        signature="(ai)"))
+
+def action_id(bind_id, label=""):
+    return dbus.Array([COMPONENT, bind_id, "Sparky", label or bind_id], signature="s")
+
+def on_pressed(component, name, _timestamp):
+    if component == COMPONENT and name in commands:
+        subprocess.Popen(commands[name], shell=True, start_new_session=True)
+
+def sync():
+    global mtime
+    try:
+        st = os.stat(PATH)
+        if st.st_mtime == mtime:
+            return True
+        mtime = st.st_mtime
+        binds = json.load(open(PATH)).get("binds", [])
+    except (OSError, ValueError):
+        return True
+
+    commands.clear()
+    seen = set()
+    for b in binds:
+        bid = b.get("id")
+        if not bid:
+            continue
+        if b.get("kwin"):
+            code = parse(b.get("keys", ""))
+            if code:
+                release_conflicts(code, keep=b["kwin"])
+            set_kwin(b["kwin"], code)
+            continue
+        seen.add(bid)
+        commands[bid] = b.get("command", "")
+        aid = action_id(bid, b.get("label", ""))
+        accel.doRegister(aid)
+        code = parse(b.get("keys", ""))
+        if code:
+            release_conflicts(code)
+        keys = dbus.Array([dbus.Int32(code)] if code else [], signature="i")
+        accel.setShortcut(aid, keys, dbus.UInt32(6))
+    for gone in registered - seen:
+        accel.unregister(COMPONENT, gone)
+    registered.clear()
+    registered.update(seen)
+    return True
+
+accel.blockGlobalShortcuts(False)
+sync()
+path = accel.getComponent(COMPONENT)
+bus.add_signal_receiver(on_pressed, "globalShortcutPressed",
+                        "org.kde.kglobalaccel.Component", path=str(path))
+
+parent = os.getppid()
+
+def tick():
+    if os.getppid() != parent:
+        os._exit(0)
+    return sync()
+
+GLib.timeout_add(700, tick)
+GLib.MainLoop().run()

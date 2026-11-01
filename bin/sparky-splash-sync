@@ -1,0 +1,49 @@
+#!/usr/bin/env python3
+import json
+import os
+import pwd
+import shutil
+import subprocess
+
+HOME = os.path.expanduser("~")
+SPLASH = os.path.join(HOME, ".local/share/plasma/look-and-feel/sparky.splash/contents/splash")
+IMAGES = os.path.join(SPLASH, "images")
+
+def main():
+    os.makedirs(IMAGES, exist_ok=True)
+
+    try:
+        current = json.load(open(os.path.join(HOME, ".config/sparky/wallpapers.json")))["current"]
+    except (OSError, ValueError, KeyError):
+        current = ""
+    still = current
+    if current.lower().endswith((".mp4", ".gif")):
+        still = os.path.join(HOME, ".cache/sparky/thumbs", os.path.basename(current) + ".jpg")
+        big = os.path.join(HOME, ".cache/sparky/thumbs", os.path.basename(current) + ".full.jpg")
+        if not os.path.exists(big) and os.path.exists(current):
+            subprocess.run(["ffmpeg", "-v", "error", "-y", "-ss", "1", "-i", current, "-frames:v", "1",
+                            "-vf", "scale=-2:1080", "-q:v", "3", big])
+        if os.path.exists(big):
+            still = big
+    if still and os.path.exists(still):
+        shutil.copyfile(still, os.path.join(IMAGES, "wallpaper.jpg"))
+
+    user = pwd.getpwuid(os.getuid())
+    for f in (f"/var/lib/AccountsService/icons/{user.pw_name}", os.path.join(HOME, ".face")):
+        if os.path.isfile(f):
+            shutil.copyfile(f, os.path.join(IMAGES, "avatar.png"))
+            break
+
+    name = (user.pw_gecos.split(",")[0] or user.pw_name).split(" ")[0]
+    with open(os.path.join(SPLASH, "Info.qml"), "w") as f:
+        f.write("import QtQuick\n\n// written by ~/.local/bin/sparky-splash-sync\n"
+                f"QtObject {{ readonly property string name: {json.dumps(name)} }}\n")
+
+    for font in ("Google Sans Flex",):
+        path = subprocess.run(["fc-match", "-f", "%{file}", font], capture_output=True, text=True).stdout
+        if path and os.path.exists(path):
+            os.makedirs(os.path.join(SPLASH, "fonts"), exist_ok=True)
+            shutil.copyfile(path, os.path.join(SPLASH, "fonts", "GoogleSansFlex.ttf"))
+
+if __name__ == "__main__":
+    main()

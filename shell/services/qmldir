@@ -1,0 +1,16 @@
+singleton Config Config.qml
+singleton Apps Apps.qml
+singleton LauncherState LauncherState.qml
+singleton SnipState SnipState.qml
+singleton SettingsState SettingsState.qml
+singleton Wallpaper Wallpaper.qml
+singleton Binds Binds.qml
+singleton Windows Windows.qml
+singleton Clipboard Clipboard.qml
+singleton Icons Icons.qml
+singleton Notifs Notifs.qml
+singleton Power Power.qml
+singleton User User.qml
+singleton DockState DockState.qml
+singleton Hardware Hardware.qml
+singleton TopBarConfig TopBarConfig.qml

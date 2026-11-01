@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Sparky
+Comment=Sparky shell (dock, launcher, notifications)
+Exec=qs -c sparky --no-duplicate
+Icon=preferences-desktop
+X-KDE-autostart-phase=2
+X-GNOME-Autostart-enabled=true
+NoDisplay=true

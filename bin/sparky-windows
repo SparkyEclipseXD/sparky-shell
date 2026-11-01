@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import itertools
+
+import dbus
+import dbus.service
+from dbus.mainloop.glib import DBusGMainLoop
+from gi.repository import GLib
+
+DBusGMainLoop(set_as_default=True)
+bus = dbus.SessionBus()
+
+OUT_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "sparky")
+OUT = os.path.join(OUT_DIR, "windows.json")
+DESKTOPS_OUT = os.path.join(OUT_DIR, "desktops.json")
+LISTENER = os.path.expanduser("~/.local/share/sparky/windows.kwinscript.js")
+os.makedirs(OUT_DIR, exist_ok=True)
+
+scripting = dbus.Interface(bus.get_object("org.kde.KWin", "/Scripting"), "org.kde.kwin.Scripting")
+counter = itertools.count()
+
+def run_script(path, name):
+    scripting.unloadScript(name)
+    sid = int(scripting.loadScript(path, name, signature="ss"))
+    script = bus.get_object("org.kde.KWin", f"/Scripting/Script{sid}")
+    dbus.Interface(script, "org.kde.kwin.Script").run()
+
+def run_oneshot(body):
+    fd, path = tempfile.mkstemp(suffix=".js", dir=OUT_DIR)
+    with os.fdopen(fd, "w") as f:
+        f.write(body)
+    name = f"sparky-once-{next(counter)}"
+    run_script(path, name)
+    GLib.timeout_add(1500, lambda: (scripting.unloadScript(name), os.unlink(path), False)[2])
+
+desktops = dbus.Interface(bus.get_object("org.kde.KWin", "/VirtualDesktopManager"),
+                          "org.kde.KWin.VirtualDesktopManager")
+desktop_props = dbus.Interface(bus.get_object("org.kde.KWin", "/VirtualDesktopManager"),
+                               "org.freedesktop.DBus.Properties")
+
+def write(path, payload):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(payload)
+    os.replace(tmp, path)
+
+class Service(dbus.service.Object):
+    @dbus.service.method("org.sparky.Windows", in_signature="s")
+    def Update(self, payload):
+        write(OUT, payload)
+
+    @dbus.service.method("org.sparky.Windows", in_signature="s")
+    def UpdateDesktops(self, payload):
+        write(DESKTOPS_OUT, payload)
+
+    @dbus.service.method("org.sparky.Windows", in_signature="ss")
+    def MoveToDesktop(self, wid, did):
+        run_oneshot(f"""
+const w = workspace.windowList().find(w => w.internalId.toString() === {json.dumps(wid)});
+const d = workspace.desktops.find(d => d.id === {json.dumps(did)});
+if (w && d) {{ w.onAllDesktops = false; w.desktops = [d]; }}
+""")
+
+    @dbus.service.method("org.sparky.Windows", in_signature="s")
+    def SwitchDesktop(self, did):
+        desktop_props.Set("org.kde.KWin.VirtualDesktopManager", "current", dbus.String(did))
+
+    @dbus.service.method("org.sparky.Windows", in_signature="s")
+    def AddDesktop(self, name):
+        count = int(desktop_props.Get("org.kde.KWin.VirtualDesktopManager", "count"))
+        desktops.createDesktop(dbus.UInt32(count), name)
+
+    @dbus.service.method("org.sparky.Windows", in_signature="s")
+    def RemoveDesktop(self, did):
+        if int(desktop_props.Get("org.kde.KWin.VirtualDesktopManager", "count")) > 1:
+            desktops.removeDesktop(did)
+
+    @dbus.service.method("org.sparky.Windows", in_signature="ss")
+    def RenameDesktop(self, did, name):
+        desktops.setDesktopName(did, name)
+
+    @dbus.service.method("org.sparky.Windows", in_signature="s")
+    def Activate(self, wid):
+        run_oneshot(f"""
+const w = workspace.windowList().find(w => w.internalId.toString() === {json.dumps(wid)});
+if (w) {{ if (w.minimized) w.minimized = false; workspace.activeWindow = w; }}
+""")
+
+    @dbus.service.method("org.sparky.Windows", in_signature="s")
+    def Close(self, wid):
+        run_oneshot(f"""
+const w = workspace.windowList().find(w => w.internalId.toString() === {json.dumps(wid)});
+if (w) w.closeWindow();
+""")
+
+name = dbus.service.BusName("org.sparky.Windows", bus, allow_replacement=True,
+                            replace_existing=True, do_not_queue=True)
+bus.add_signal_receiver(lambda n: n == "org.sparky.Windows" and os._exit(0),
+                        "NameLost", "org.freedesktop.DBus")
+service = Service(bus, "/")
+
+run_script(LISTENER, "sparky-windows")
+
+parent = os.getppid()
+
+def tick():
+    if os.getppid() != parent:
+        scripting.unloadScript("sparky-windows")
+        os._exit(0)
+    return True
+
+GLib.timeout_add(1000, tick)
+GLib.MainLoop().run()

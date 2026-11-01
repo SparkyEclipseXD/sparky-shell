@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=App Manager
+Comment=See and uninstall apps; install .deb, .rpm and .AppImage files
+Exec=@HOME@/.local/bin/app-manager %F
+Icon=system-software-install
+Terminal=false
+Categories=System;PackageManager;
+Keywords=uninstall;remove;apps;deb;rpm;appimage;install;package;
+MimeType=application/vnd.debian.binary-package;application/x-debian-package;application/x-rpm;application/vnd.appimage;application/x-iso9660-appimage;
+StartupWMClass=dev.sparky.AppManager

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Task Manager
+Comment=See running apps, CPU, GPU, memory and network usage
+Exec=@HOME@/.local/bin/taskman
+Icon=utilities-system-monitor
+Terminal=false
+Categories=System;Monitor;
+Keywords=processes;task;kill;cpu;gpu;memory;performance;
+StartupWMClass=dev.sparky.TaskManager

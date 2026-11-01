@@ -1,0 +1,12 @@
+{
+    "KPackageStructure": "KWin/WindowSwitcher",
+    "KPlugin": {
+        "Authors": [{ "Name": "Sparky" }],
+        "Description": "Monochrome glass window switcher matching the Sparky shell",
+        "Icon": "preferences-system-windows-switcher-thumbnail-grid",
+        "Id": "sparky",
+        "License": "GPL",
+        "Name": "Sparky"
+    },
+    "X-Plasma-API": "declarativeappletscript"
+}

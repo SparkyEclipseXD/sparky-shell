@@ -1,0 +1,11 @@
+{
+    "KPackageStructure": "Plasma/Shell",
+    "X-Plasma-APIVersion": "2",
+    "KPlugin": {
+        "Id": "sparky.desktop",
+        "Name": "Sparky Lock Screen",
+        "Description": "Sparky's lock screen for KDE Plasma: the login screen's design, shown when the session locks.",
+        "License": "GPL-3.0-or-later",
+        "Version": "1.0.0"
+    }
+}

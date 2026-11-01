@@ -1,0 +1,1151 @@
+#!/usr/bin/env python3
+import getpass
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from pathlib import Path
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk
+
+sys.path.insert(0, os.path.expanduser("~/.local/lib/sparky"))
+import sparkyui as ui
+
+APP_ID = "dev.sparky.AppManager"
+HOME = Path.home()
+DATA = HOME / ".local/share/app-installer"
+PKG_DIR = DATA / "packages"
+RECORDS = DATA / "installed.json"
+APPIMAGE_DIR = HOME / "Applications"
+USER_APPS = HOME / ".local/share/applications"
+USER_ICONS = HOME / ".local/share/icons"
+STD_ICON_SIZES = {16, 22, 24, 32, 48, 64, 96, 128, 192, 256, 512}
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+def human(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit in ("B", "KB") else f"{n:.1f} {unit}"
+        n /= 1024
+
+def load_records():
+    try:
+        return json.loads(RECORDS.read_text())
+    except (OSError, ValueError):
+        return {}
+
+def save_records(rec):
+    DATA.mkdir(parents=True, exist_ok=True)
+    RECORDS.write_text(json.dumps(rec, indent=2))
+
+def slug(s):
+    s = re.sub(r"[^a-z0-9@._+-]+", "-", s.lower()).strip("-.")
+    return s or "app"
+
+def pkgver_safe(v):
+    v = re.sub(r"^\d+:", "", v or "")
+    v = re.sub(r"[^A-Za-z0-9._+]", "_", v)
+    return v or "1"
+
+def parse_desktop(path):
+    entry, section = {}, None
+    for line in Path(path).read_text(errors="replace").splitlines():
+        line = line.strip()
+        if line.startswith("["):
+            section = line
+        elif section == "[Desktop Entry]" and "=" in line and not line.startswith("#"):
+            k, v = line.split("=", 1)
+            entry.setdefault(k.strip(), v.strip())
+    return entry
+
+def is_elf(p):
+    try:
+        with open(p, "rb") as f:
+            return f.read(4) == b"\x7fELF"
+    except OSError:
+        return False
+
+class Pkg:
+
+    def __init__(self, path):
+        self.path = Path(path).resolve()
+        self.kind = self._kind()
+        self.name = self.path.stem
+        self.version = ""
+        self.description = ""
+        self.homepage = ""
+        self.arch = "x86_64"
+        self.pkgname = ""
+        self._inspect()
+
+    def _kind(self):
+        n = self.path.name.lower()
+        if n.endswith(".deb"):
+            return "deb"
+        if n.endswith(".rpm"):
+            return "rpm"
+        if n.endswith(".appimage"):
+            return "appimage"
+        raise ValueError("Unsupported file type (use .deb, .rpm or .AppImage)")
+
+    def _inspect(self):
+        if self.kind == "deb":
+            with tempfile.TemporaryDirectory() as t:
+                run(["bsdtar", "-xf", str(self.path), "-C", t], check=True)
+                ctrl = next(Path(t).glob("control.tar*"))
+                cdir = Path(t) / "c"
+                cdir.mkdir()
+                run(["bsdtar", "-xf", str(ctrl), "-C", str(cdir)], check=True)
+                fields, key = {}, None
+                for line in (cdir / "control").read_text(errors="replace").splitlines():
+                    if line[:1] in (" ", "\t") and key:
+                        fields[key] += "\n" + line.strip()
+                    elif ":" in line:
+                        key, val = line.split(":", 1)
+                        fields[key] = val.strip()
+            self.name = fields.get("Package", self.name)
+            self.version = fields.get("Version", "")
+            desc = fields.get("Description", "").strip().split("\n")
+            self.description = next((d for d in desc if d and d != "."), "")
+            self.homepage = fields.get("Homepage", "")
+            self.arch = {"amd64": "x86_64", "all": "any"}.get(fields.get("Architecture", "amd64"), "x86_64")
+            self.pkgname = self._pick_pkgname("deb")
+        elif self.kind == "rpm":
+            m = re.match(r"^(.+?)-([^-]+)-([^-]+)\.([^.]+)\.rpm$", self.path.name, re.I)
+            if m:
+                self.name, self.version, _, a = m.groups()
+                self.arch = "any" if a == "noarch" else "x86_64"
+            self.pkgname = self._pick_pkgname("rpm")
+        else:
+            base = re.sub(r"(?i)\.appimage$", "", self.path.name)
+            m = re.match(r"^(.+?)[-_ ]v?(\d[\w.]*)", base)
+            self.name, self.version = (m.group(1), m.group(2)) if m else (base, "")
+            self.pkgname = "appimage-" + slug(self.name)
+
+    def _pick_pkgname(self, suffix):
+        name = slug(self.name)
+        rec = load_records()
+        if name in rec:
+            return name
+        if run(["pacman", "-Si", name]).returncode == 0 or \
+           (run(["pacman", "-Q", name]).returncode == 0 and name not in rec):
+            return f"{name}-{suffix}"
+        return name
+
+    def installed(self):
+        rec = load_records()
+        if self.kind == "appimage":
+            return self.pkgname in rec
+        return self.pkgname in rec and run(["pacman", "-Q", self.pkgname]).returncode == 0
+
+SYSTEM_APP_DIRS = [Path("/usr/share/applications"), Path("/usr/local/share/applications")]
+SELF_IDS = {APP_ID + ".desktop"}
+CORE_PKGS = {"hyprland", "quickshell", "quickshell-git", "kitty", "alacritty", "fish", "nautilus",
+             "pacman", "systemd", "greetd", "polkit", "xdg-desktop-portal-hyprland"}
+
+def remove_appimage(r):
+    for key in ("file", "icon"):
+        if r.get(key):
+            Path(r[key]).unlink(missing_ok=True)
+    if r.get("desktop"):
+        (USER_APPS / r["desktop"]).unlink(missing_ok=True)
+    run(["update-desktop-database", str(USER_APPS)])
+
+class AppEntry:
+
+    def __init__(self, info):
+        self.info = info
+        self.id = info.get_id()
+        self.name = info.get_display_name()
+        self.file = info.get_filename()
+        self.kind = "pacman"
+        self.pkg = ""
+        self.owner_file = self.file
+        self.size = ""
+        self.from_file = ""
+
+    @property
+    def subtitle(self):
+        return {
+            "pacman": " · ".join(x for x in (self.pkg, self.size, self.from_file and f"from .{self.from_file}") if x),
+            "appimage": " · ".join(x for x in ("AppImage", self.size) if x),
+            "flatpak": f"Flatpak · {self.pkg}",
+            "shortcut": "Launcher shortcut only",
+            "unknown": "Not managed by a package – can't uninstall",
+        }[self.kind]
+
+def scan_apps(infos):
+    rec = load_records()
+    by_desktop = {r.get("desktop"): k for k, r in rec.items() if r.get("desktop")}
+    apps = []
+    for info in infos:
+        e = AppEntry(info)
+        if e.id in SELF_IDS or not e.file:
+            continue
+        if "/flatpak/exports/" in e.file:
+            e.kind, e.pkg = "flatpak", e.id.removesuffix(".desktop")
+        elif e.file.startswith(str(USER_APPS)):
+            sysfile = next((d / e.id for d in SYSTEM_APP_DIRS if (d / e.id).exists()), None)
+            if sysfile:
+                e.owner_file = str(sysfile)
+            elif e.id in by_desktop and rec[by_desktop[e.id]].get("kind") == "appimage":
+                e.kind, e.pkg = "appimage", by_desktop[e.id]
+                f = Path(rec[e.pkg].get("file", ""))
+                e.size = human(f.stat().st_size) if f.is_file() else ""
+            else:
+                e.kind = "shortcut"
+        apps.append(e)
+
+    native = [e for e in apps if e.kind == "pacman"]
+    owners = {}
+    if native:
+        r = run(["pacman", "-Qo", *{e.owner_file for e in native}])
+        for line in r.stdout.splitlines():
+            m = re.match(r"^(.*) is owned by (\S+) \S+$", line)
+            if m:
+                owners[m.group(1)] = m.group(2)
+    sizes = {}
+    if owners:
+        name = None
+        for line in run(["pacman", "-Qi", *set(owners.values())]).stdout.splitlines():
+            if line.startswith("Name"):
+                name = line.split(":", 1)[1].strip()
+            elif line.startswith("Installed Size") and name:
+                sizes[name] = line.split(":", 1)[1].strip().replace("iB", "B")
+    for e in native:
+        e.pkg = owners.get(e.owner_file, "")
+        if not e.pkg:
+            e.kind = "unknown"
+            continue
+        e.size = sizes.get(e.pkg, "")
+        if rec.get(e.pkg, {}).get("kind") in ("deb", "rpm"):
+            e.from_file = rec[e.pkg]["kind"]
+    return sorted(apps, key=lambda e: e.name.casefold())
+
+def required_by(pkg):
+    for line in run(["pacman", "-Qi", pkg]).stdout.splitlines():
+        if line.startswith("Required By"):
+            v = line.split(":", 1)[1].strip()
+            return [] if v == "None" else v.split()
+    return []
+
+def uninstall_entry(e):
+    if e.kind == "pacman":
+        r = run(["pkexec", "pacman", "-Rs", "--noconfirm", e.pkg])
+        if r.returncode != 0:
+            out = (r.stderr or r.stdout).strip()
+            raise RuntimeError(out.splitlines()[-1] if out else f"pacman exited with {r.returncode}")
+        if e.file.startswith(str(USER_APPS)):
+            Path(e.file).unlink(missing_ok=True)
+    elif e.kind == "appimage":
+        remove_appimage(load_records().get(e.pkg, {}))
+    elif e.kind == "flatpak":
+        r = run(["flatpak", "uninstall", "-y", "--noninteractive", e.pkg])
+        if r.returncode != 0:
+            raise RuntimeError((r.stderr or r.stdout).strip() or "flatpak failed")
+    elif e.kind == "shortcut":
+        Path(e.file).unlink(missing_ok=True)
+        run(["update-desktop-database", str(USER_APPS)])
+    else:
+        raise RuntimeError("This app isn't owned by any package.")
+    rec = load_records()
+    if rec.pop(e.pkg, None) is not None:
+        save_records(rec)
+
+class Installer:
+    def __init__(self, pkg, step):
+        self.pkg = pkg
+        self.step = step
+        self.log = []
+        self.desktop_id = None
+        self.missing_libs = []
+
+    def sh(self, cmd, **kw):
+        r = run(cmd, **kw)
+        self.log.append(f"$ {' '.join(cmd)}\n{r.stdout}{r.stderr}")
+        if r.returncode != 0:
+            raise RuntimeError((r.stderr or r.stdout).strip().splitlines()[-1] if (r.stderr or r.stdout).strip()
+                               else f"{cmd[0]} failed")
+        return r
+
+    def install_native(self):
+        p = self.pkg
+        build = Path(tempfile.mkdtemp(prefix="app-installer-"))
+        try:
+            root = build / "root"
+            root.mkdir()
+            self.step("Unpacking…")
+            scripts = ""
+            if p.kind == "deb":
+                work = build / "deb"
+                work.mkdir()
+                self.sh(["bsdtar", "-xf", str(p.path), "-C", str(work)])
+                self.sh(["bsdtar", "-xf", str(next(work.glob("data.tar*"))), "-C", str(root)])
+                cdir = work / "control"
+                cdir.mkdir()
+                self.sh(["bsdtar", "-xf", str(next(work.glob("control.tar*"))), "-C", str(cdir)])
+                scripts = "".join((cdir / s).read_text(errors="replace") for s in ("postinst", "preinst")
+                                  if (cdir / s).exists())
+            else:
+                self.sh(["bsdtar", "-xf", str(p.path), "-C", str(root)])
+
+            self.step("Adapting for Arch…")
+            self._fixup(root, scripts)
+
+            self.step("Building package…")
+            desc = re.sub(r'["$`\\]', "", p.description or p.name)[:200]
+            url = re.sub(r'["$`\\\s]', "", p.homepage)
+            (build / "PKGBUILD").write_text(f"""pkgname={p.pkgname}
+pkgver={pkgver_safe(p.version)}
+pkgrel=1
+pkgdesc="{desc} (from .{p.kind} via App Manager)"
+arch=('{p.arch}')
+url="{url}"
+license=('custom')
+options=('!strip' '!debug' '!lto')
+package() {{ cp -a "$startdir/root/." "$pkgdir/"; }}
+""")
+            PKG_DIR.mkdir(parents=True, exist_ok=True)
+            env = dict(os.environ, PKGDEST=str(PKG_DIR))
+            self.sh(["makepkg", "-f", "--nodeps", "--noconfirm"], cwd=build, env=env)
+            out = self.sh(["makepkg", "--packagelist"], cwd=build, env=env).stdout.split()
+            pkgfile = next(f for f in out if Path(f).exists())
+
+            self.step("Installing (enter your password)…")
+            self.sh(["pkexec", "pacman", "-U", "--noconfirm", pkgfile])
+
+            files = self.sh(["pacman", "-Qlq", p.pkgname]).stdout.split("\n")
+            self.desktop_id = next((Path(f).name for f in files
+                                    if f.startswith("/usr/share/applications/") and f.endswith(".desktop")), None)
+            self.step("Checking libraries…")
+            self._check_libs([f for f in files if f and not f.endswith("/")])
+
+            rec = load_records()
+            rec[p.pkgname] = {"kind": p.kind, "name": p.name, "version": p.version,
+                              "desktop": self.desktop_id, "source": str(p.path)}
+            save_records(rec)
+        finally:
+            shutil.rmtree(build, ignore_errors=True)
+
+    def _fixup(self, root, scripts):
+        for f in root.rglob("chrome-sandbox"):
+            f.chmod(0o755)
+        shutil.rmtree(root / "etc/apparmor.d", ignore_errors=True)
+        for f in root.rglob("apparmor-profile"):
+            f.unlink()
+        shutil.rmtree(root / "etc/apt", ignore_errors=True)
+        for old, new in (("lib", "usr/lib"), ("lib64", "usr/lib"), ("bin", "usr/bin"),
+                         ("sbin", "usr/bin"), ("usr/sbin", "usr/bin"), ("usr/lib64", "usr/lib")):
+            src = root / old
+            if src.is_dir() and not src.is_symlink():
+                shutil.copytree(src, root / new, symlinks=True, dirs_exist_ok=True)
+                shutil.rmtree(src)
+        bindir = root / "usr/bin"
+
+        def link(target, name):
+            dest = bindir / Path(name).name
+            if not dest.exists() and not dest.is_symlink() and (root / target.lstrip("/")).exists():
+                bindir.mkdir(parents=True, exist_ok=True)
+                dest.symlink_to(target)
+
+        q = r"""['"]?"""
+        for m in re.finditer(rf"update-alternatives\s+--install\s+{q}(/usr/bin/[^'\"\s]+){q}\s+\S+\s+{q}([^'\"\s]+){q}", scripts):
+            link(m.group(2), m.group(1))
+        for m in re.finditer(rf"ln\s+-\w*s\w*\s+{q}(/[^'\"\s]+){q}\s+{q}(/usr/bin/[^'\"\s]+){q}", scripts):
+            link(m.group(1), m.group(2))
+        for d in (root / "usr/share/applications").glob("*.desktop"):
+            exe = parse_desktop(d).get("Exec", "").split(" ")[0].strip("'\"")
+            if exe.startswith("/") and not exe.startswith("/usr/bin/"):
+                link(exe, Path(exe).name)
+            real = (root / exe.lstrip("/")).resolve() if exe.startswith("/") else None
+            if real and (real.parent / "chrome_100_percent.pak").exists():
+                text = d.read_text()
+                if "--password-store" not in text:
+                    d.write_text(re.sub(r"^(Exec=\S+)", r"\1 --password-store=gnome-libsecret",
+                                        text, flags=re.M))
+
+        hicolor = root / "usr/share/icons/hicolor"
+        for d in list(hicolor.glob("*x*")):
+            try:
+                size = int(d.name.split("x")[0])
+            except ValueError:
+                continue
+            if size in STD_ICON_SIZES:
+                continue
+            for png in (d / "apps").glob("*.png"):
+                for s in (512, 256, 128, 64):
+                    if s <= size or s == 512:
+                        out = hicolor / f"{s}x{s}/apps" / png.name
+                        if not out.exists():
+                            out.parent.mkdir(parents=True, exist_ok=True)
+                            self.sh(["magick", str(png), "-resize", f"{s}x{s}", str(out)])
+            shutil.rmtree(d)
+
+    def _check_libs(self, files):
+        missing = set()
+        checked = 0
+        for f in files:
+            if checked > 300:
+                break
+            if os.path.isfile(f) and not os.path.islink(f) and os.access(f, os.X_OK) or f.endswith(".so"):
+                if not is_elf(f):
+                    continue
+                checked += 1
+                r = run(["ldd", f])
+                for line in r.stdout.splitlines():
+                    if "not found" in line:
+                        lib = line.split("=>")[0].strip()
+                        if not any(Path(x).name == lib for x in files):
+                            missing.add(lib)
+        self.missing_libs = sorted(missing)
+
+    def install_appimage(self):
+        p = self.pkg
+        s = slug(p.name)
+        self.step("Reading app info…")
+        with tempfile.TemporaryDirectory() as t:
+            tmp_img = Path(t) / "app.AppImage"
+            shutil.copy2(p.path, tmp_img)
+            tmp_img.chmod(0o755)
+            for pat in ("*.desktop", ".DirIcon", "*.png", "*.svg"):
+                run([str(tmp_img), "--appimage-extract", pat], cwd=t)
+            sq = Path(t) / "squashfs-root"
+            desk = next(sq.glob("*.desktop"), None) if sq.exists() else None
+            entry = parse_desktop(desk) if desk else {}
+            name = entry.get("Name", p.name)
+            icon_src = None
+            if sq.exists():
+                icon_name = entry.get("Icon", "")
+                cands = [sq / f"{icon_name}.png", sq / f"{icon_name}.svg", sq / ".DirIcon"]
+                icon_src = next((c for c in cands if c.exists()), None)
+
+            self.step("Installing…")
+            APPIMAGE_DIR.mkdir(parents=True, exist_ok=True)
+            dest = APPIMAGE_DIR / f"{re.sub(r'[^A-Za-z0-9._-]+', '-', name)}.AppImage"
+            shutil.copy2(p.path, dest)
+            dest.chmod(0o755)
+
+            icon_path = ""
+            if icon_src:
+                USER_ICONS.mkdir(parents=True, exist_ok=True)
+                real = icon_src.resolve() if icon_src.is_symlink() else icon_src
+                ext = ".svg" if real.read_bytes()[:5] in (b"<?xml", b"<svg ") else ".png"
+                icon_file = USER_ICONS / f"appimage-{s}{ext}"
+                shutil.copy2(real, icon_file)
+                icon_path = str(icon_file)
+
+        args = ""
+        if entry.get("Exec"):
+            parts = entry["Exec"].split(" ", 1)
+            args = " " + parts[1] if len(parts) > 1 else ""
+        USER_APPS.mkdir(parents=True, exist_ok=True)
+        self.desktop_id = f"appimage-{s}.desktop"
+        lines = ["[Desktop Entry]", "Type=Application", f"Name={name}",
+                 f'Exec="{dest}"{args}', f"Icon={icon_path or 'application-x-executable'}",
+                 f"Comment={entry.get('Comment', 'AppImage')}",
+                 f"Categories={entry.get('Categories', 'Utility;')}", "Terminal=false",
+                 "X-AppImage-Installer=true"]
+        if entry.get("StartupWMClass"):
+            lines.append(f"StartupWMClass={entry['StartupWMClass']}")
+        if entry.get("MimeType"):
+            lines.append(f"MimeType={entry['MimeType']}")
+        (USER_APPS / self.desktop_id).write_text("\n".join(lines) + "\n")
+        run(["update-desktop-database", str(USER_APPS)])
+
+        rec = load_records()
+        rec[p.pkgname] = {"kind": "appimage", "name": name, "version": p.version,
+                          "desktop": self.desktop_id, "file": str(dest), "icon": icon_path,
+                          "source": str(p.path)}
+        save_records(rec)
+
+    def install(self):
+        if self.pkg.kind == "appimage":
+            self.install_appimage()
+        else:
+            self.install_native()
+
+    def uninstall(self):
+        p = self.pkg
+        rec = load_records()
+        r = rec.get(p.pkgname, {})
+        if p.kind == "appimage":
+            remove_appimage(r)
+        else:
+            self.step("Removing (enter your password)…")
+            self.sh(["pkexec", "pacman", "-R", "--noconfirm", p.pkgname])
+        rec.pop(p.pkgname, None)
+        save_records(rec)
+
+CODEX = HOME / ".local/bin/codex"
+CODEX_RELEASES = "https://api.github.com/repos/openai/codex/releases/latest"
+UPDATE_SOURCES = (
+    ("repo", "System packages", "Arch/CachyOS packages. These are always updated together – "
+                                "updating only some of them can break the system."),
+    ("aur", "AUR packages", "Built on this computer, so this can take a while."),
+    ("flatpak", "Flatpak apps", ""),
+    ("codex", "Codex CLI", "Standalone install in ~/.codex"),
+)
+REBOOT_PKGS = re.compile(r"^(linux(-cachyos)?(-\w+)?|nvidia.*|mesa|systemd|glibc|hyprland|amd-ucode|intel-ucode)$")
+
+class Update:
+    def __init__(self, source, name, old, new):
+        self.source, self.name, self.old, self.new = source, name, old, new
+
+def _arrow_lines(text, source):
+    return [Update(source, *m.groups()) for m in re.finditer(r"^(\S+) (\S+) -> (\S+)", text, re.M)]
+
+def _version_tuple(v):
+    return tuple(int(x) for x in re.findall(r"\d+", v))
+
+def check_updates():
+    ups, errors = [], []
+    r = run(["checkupdates", "--nocolor"])
+    if r.returncode == 0:
+        ups += _arrow_lines(r.stdout, "repo")
+    elif r.returncode != 2:
+        errors.append("System packages: " + ((r.stderr or r.stdout).strip().splitlines() or ["check failed"])[-1])
+    if shutil.which("paru"):
+        r = run(["paru", "-Qua", "--color", "never"])
+        ups += _arrow_lines(r.stdout, "aur")
+        if "error:" in r.stderr:
+            errors.append("AUR: " + next(l for l in r.stderr.splitlines() if "error:" in l).split("error:", 1)[1].strip())
+    if shutil.which("flatpak"):
+        cols = ["--app", "--columns=application,version"]
+        have = dict(l.split("\t", 1) for l in run(["flatpak", "list", *cols]).stdout.splitlines() if "\t" in l)
+        for line in run(["flatpak", "remote-ls", "--updates", *cols]).stdout.splitlines():
+            app, _, new = line.partition("\t")
+            ups.append(Update("flatpak", app, have.get(app, ""), new))
+    if CODEX.is_symlink() and ".codex/packages/standalone" in str(CODEX.resolve()):
+        cur = (run([str(CODEX), "--version"]).stdout.split() or [""])[-1]
+        try:
+            import urllib.request
+            with urllib.request.urlopen(CODEX_RELEASES, timeout=10) as resp:
+                latest = json.load(resp)["tag_name"].removeprefix("rust-v")
+            if _version_tuple(latest) > _version_tuple(cur):
+                ups.append(Update("codex", "codex", cur, latest))
+        except (OSError, ValueError, KeyError) as e:
+            errors.append(f"Codex CLI: {e}")
+    return ups, errors
+
+PACMAN_LOCK = Path("/var/lib/pacman/db.lck")
+AS_ME = ["env", f"SUDO_USER={getpass.getuser()}", f"SUDO_HOME={HOME}"]
+
+def update_steps(ups):
+    aur = [u.name for u in ups if u.source == "aur"]
+    cmds = {
+        "repo": ["pkexec", *AS_ME, "pacman", "-Syu", "--noconfirm", "--color", "never"],
+        "aur": ["paru", "-S", "--noconfirm", "--skipreview", "--batchinstall", "--color", "never",
+                "--sudo", "pkexec", "--sudoflags", " ".join(AS_ME), *aur],
+        "flatpak": ["flatpak", "update", "-y", "--noninteractive"],
+        "codex": [str(CODEX), "update"],
+    }
+    pending = {u.source for u in ups}
+    return [(title, cmds[key]) for key, title, _ in UPDATE_SOURCES if key in pending]
+
+def stream(cmd, on_line):
+    env = dict(os.environ, CODEX_NON_INTERACTIVE="1")
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                         text=True, errors="replace", env=env)
+    for line in p.stdout:
+        on_line(line)
+    return p.wait()
+
+KIND_LABEL = {"pacman": "Package", "appimage": "AppImage", "flatpak": "Flatpak",
+              "shortcut": "Shortcut", "unknown": "System"}
+FILTERS = (("all", "All"), ("pacman", "Packages"), ("appimage", "AppImages"),
+           ("flatpak", "Flatpaks"), ("shortcut", "Shortcuts"))
+FILE_KINDS = {"deb": "Debian / Ubuntu package", "rpm": "Fedora / openSUSE package", "appimage": "AppImage"}
+
+class Window(Adw.ApplicationWindow):
+    def __init__(self, app, path):
+        super().__init__(application=app, title="App Manager")
+        self.home = path is None
+        self.set_default_size(*((980, 680) if self.home else (600, 600)))
+        self.kind_filter = "all"
+        self.updates = None
+        self.updates_shown = False
+        self.busy = False
+
+        self.frame = ui.Frame(self, "Apps", [
+            ("installed", "Installed", "view-grid-symbolic"),
+            ("updates", "Updates", "software-update-available-symbolic"),
+            ("install", "Install a file", "document-open-symbolic"),
+        ], on_switch=self._on_switch)
+
+        drop = Gtk.DropTarget.new(Gio.File, Gdk.DragAction.COPY)
+        drop.connect("drop", lambda _t, f, *_: (self.load(f.get_path()), True)[1])
+        self.add_controller(drop)
+
+        if path:
+            self.frame.hide_sidebar()
+            self.load(path)
+        else:
+            self.frame.set_page("install", self._install_page())
+            self.frame.set_page("updates", self._message_page("Updates", "", "software-update-available-symbolic",
+                                                              "Checking for updates…", spinner=True))
+            self.show_manager()
+            self._quiet_update_check()
+
+    def _on_switch(self, name):
+        if self.busy:
+            return
+        if name == "updates":
+            if self.updates is None:
+                self.show_updates()
+            elif not self.updates_shown:
+                self._show_update_list(*self.updates)
+
+    def show(self, name, widget):
+        self.frame.set_page(name, widget)
+        self.frame.show(name)
+
+    def finish(self):
+        if self.home:
+            self.busy = False
+            self.show_manager()
+        else:
+            self.close()
+
+    def _message_page(self, title, subtitle, icon, heading, body="", spinner=False, buttons=(), extra=None):
+        page = ui.Page(title, subtitle)
+        inner = ui.box(True, 14, halign=Gtk.Align.CENTER)
+        if spinner:
+            sp = Adw.Spinner(halign=Gtk.Align.CENTER)
+            sp.set_size_request(44, 44)
+            inner.append(sp)
+        else:
+            t = ui.icon_tile(icon, 64, 30)
+            t.set_halign(Gtk.Align.CENTER)
+            inner.append(t)
+        inner.append(ui.label(heading, "page-title", xalign=0.5, wrap=True, justify=Gtk.Justification.CENTER))
+        if body:
+            inner.append(ui.label(body, "dim", xalign=0.5, wrap=True, justify=Gtk.Justification.CENTER,
+                                  max_width_chars=60))
+        if extra is not None:
+            inner.append(extra)
+        if buttons:
+            inner.append(ui.box(False, 10, *buttons, halign=Gtk.Align.CENTER, margin_top=6))
+        c = ui.card(inner)
+        c.set_valign(Gtk.Align.CENTER)
+        c.set_vexpand(True)
+        c.set_margin_bottom(40)
+        for side in ("top", "bottom"):
+            getattr(inner, f"set_margin_{side}")(26)
+        page.body.append(Adw.Clamp(child=c, maximum_size=560, vexpand=True))
+        return page
+
+    def _quiet_update_check(self):
+        def job():
+            result = check_updates()
+            GLib.idle_add(done, result)
+
+        def done(result):
+            self.updates = result
+            n = len(result[0])
+            self.frame.set_badge("updates", str(n) if n else "")
+            if self.frame.current == "updates" and not self.busy:
+                self._show_update_list(*result)
+        threading.Thread(target=job, daemon=True).start()
+
+    def show_manager(self):
+        page = ui.Page("Installed", "Looking through your apps…")
+        self.list_page = page
+        page.actions.append(ui.button("Install a file", "list-add-symbolic", "soft", on_click=self.on_pick))
+
+        bar = ui.box(False, 8)
+        self.search = Gtk.SearchEntry(placeholder_text="Search apps", hexpand=True)
+        self.search.set_key_capture_widget(self)
+        bar.append(ui.smooth(self.search))
+        first = None
+        for key, title in FILTERS:
+            t = Gtk.ToggleButton(label=title, active=key == self.kind_filter, group=first)
+            first = first or t
+            t.add_css_class("filter")
+            t.set_valign(Gtk.Align.CENTER)
+            t.connect("toggled", lambda b, k=key: b.get_active() and self._set_filter(k))
+            bar.append(t)
+        page.body.append(bar)
+
+        self.listbox = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        self.listbox.add_css_class("cards")
+        self.search.connect("search-changed", lambda *_: self._refilter())
+        self.no_match = ui.label("No apps match", "dim", xalign=0.5, margin_top=40)
+        self.no_match.set_opacity(0)
+
+        spinner = Adw.Spinner(halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER, vexpand=True)
+        spinner.set_size_request(40, 40)
+        self.list_holder = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE, vexpand=True)
+        self.list_holder.add_named(spinner, "loading")
+        scroll = Gtk.ScrolledWindow(child=ui.box(True, 0, self.listbox, self.no_match), vexpand=True)
+        self.list_holder.add_named(scroll, "list")
+        page.body.append(self.list_holder)
+        self.show("installed", page)
+
+        infos = [a for a in Gio.AppInfo.get_all() if a.should_show() and hasattr(a, "get_filename")]
+
+        def job():
+            apps = scan_apps(infos)
+            GLib.idle_add(self._fill, apps)
+        threading.Thread(target=job, daemon=True).start()
+
+    def _fill(self, apps):
+        for e in apps:
+            row = Gtk.ListBoxRow(activatable=False)
+            row.entry = e
+            icon = Gtk.Image(pixel_size=36)
+            if e.info.get_icon():
+                icon.set_from_gicon(e.info.get_icon())
+            else:
+                icon.set_from_icon_name("application-x-executable")
+            texts = ui.box(True, 2, hexpand=True, valign=Gtk.Align.CENTER)
+            texts.append(ui.label(e.name, ellipsize=True))
+            texts.append(ui.label(e.subtitle, "dim", ellipsize=True))
+            chip = ui.label(KIND_LABEL[e.kind], "chip", valign=Gtk.Align.CENTER)
+            inner = ui.box(False, 14, icon, texts, chip)
+            if e.kind != "unknown":
+                b = ui.button(None, "user-trash-symbolic", "circle", "danger", "reveal", tooltip="Uninstall",
+                              on_click=lambda r=row: self.ask_uninstall(r))
+                inner.append(b)
+            else:
+                inner.append(Gtk.Box(width_request=34))
+            row.set_child(Gtk.Revealer(child=inner, reveal_child=True, transition_duration=220,
+                                       transition_type=Gtk.RevealerTransitionType.SLIDE_DOWN))
+            self.listbox.append(row)
+        self._update_count()
+        self.list_holder.set_visible_child_name("list")
+        self.search.grab_focus()
+
+    def _set_filter(self, key):
+        self.kind_filter = key
+        self._refilter()
+
+    def _refilter(self):
+        shown = 0
+        for row in self._rows():
+            rev = row.get_child()
+            want = self._filter(row)
+            shown += want
+            if want and not row.get_visible():
+                row.set_visible(True)
+            if rev.get_reveal_child() != want:
+                rev.set_reveal_child(want)
+                if not want:
+                    def done(r=rev, rw=row):
+                        if not r.get_reveal_child():
+                            rw.set_visible(False)
+                        return False
+                    GLib.timeout_add(rev.get_transition_duration() + 20, done)
+        self.no_match.set_opacity(0 if shown else 1)
+
+    def _filter(self, row):
+        e = row.entry
+        if self.kind_filter != "all" and e.kind != self.kind_filter:
+            return False
+        q = self.search.get_text().strip().casefold()
+        return not q or q in e.name.casefold() or q in e.pkg.casefold()
+
+    def _rows(self):
+        row = self.listbox.get_first_child()
+        while row:
+            if isinstance(row, Gtk.ListBoxRow):
+                yield row
+            row = row.get_next_sibling()
+
+    def _update_count(self):
+        rows = list(self._rows())
+        kinds = {}
+        for r in rows:
+            kinds[r.entry.kind] = kinds.get(r.entry.kind, 0) + 1
+        parts = [f"{len(rows)} apps"] + [f"{n} {KIND_LABEL[k].lower()}{'s' if n != 1 else ''}"
+                                         for k, n in kinds.items() if k in ("appimage", "flatpak")]
+        self.list_page.set_subtitle("  ·  ".join(parts))
+
+    def ask_uninstall(self, row):
+        e = row.entry
+        siblings = [r.entry.name for r in self._rows() if r is not row and e.kind == "pacman" and r.entry.pkg == e.pkg]
+        if e.kind == "pacman":
+            needed = required_by(e.pkg)
+            if needed:
+                dlg = Adw.AlertDialog(heading=f"Can't uninstall {e.name}",
+                                      body=f"Other packages need {e.pkg}: {', '.join(needed[:6])}"
+                                           + ("…" if len(needed) > 6 else ""))
+                dlg.add_response("ok", "OK")
+                dlg.present(self)
+                return
+        body = {
+            "pacman": f"This removes the package “{e.pkg}” and anything it pulled in that nothing else uses.",
+            "appimage": "This deletes the AppImage and its launcher entry.",
+            "flatpak": f"This removes the Flatpak “{e.pkg}”.",
+            "shortcut": f"This only removes the launcher entry ({Path(e.file).name}); no program files are touched.",
+        }[e.kind]
+        if siblings:
+            body += "\n\nThese apps come from the same package and will be removed too: " + ", ".join(siblings)
+        if e.pkg in CORE_PKGS:
+            body += "\n\n⚠ Your desktop depends on this. Removing it may break your session."
+        dlg = Adw.AlertDialog(heading=f"Uninstall {e.name}?", body=body)
+        dlg.add_response("cancel", "Cancel")
+        dlg.add_response("remove", "Uninstall")
+        dlg.set_response_appearance("remove", Adw.ResponseAppearance.DESTRUCTIVE)
+        dlg.set_default_response("cancel")
+        dlg.connect("response", lambda _d, resp: resp == "remove" and self.do_uninstall(row))
+        dlg.present(self)
+
+    def do_uninstall(self, row):
+        e = row.entry
+        inner = row.get_child().get_child()
+        trash = inner.get_last_child()
+        spinner = Adw.Spinner(valign=Gtk.Align.CENTER)
+        spinner.set_size_request(34, 20)
+        inner.remove(trash)
+        inner.append(spinner)
+        row.set_sensitive(False)
+
+        def job():
+            try:
+                uninstall_entry(e)
+            except Exception as ex:
+                GLib.idle_add(self._uninstall_failed, row, spinner, trash, str(ex))
+                return
+            GLib.idle_add(self._uninstalled, row)
+        threading.Thread(target=job, daemon=True).start()
+
+    def _uninstalled(self, row):
+        e = row.entry
+        for r in list(self._rows()):
+            if r is row or (e.kind == "pacman" and r.entry.pkg == e.pkg):
+                self.listbox.remove(r)
+        self._update_count()
+        self.frame.toast(f"{e.name} uninstalled")
+
+    def _uninstall_failed(self, row, spinner, trash, msg):
+        inner = row.get_child().get_child()
+        inner.remove(spinner)
+        inner.append(trash)
+        row.set_sensitive(True)
+        if "dismissed" in msg or "Not authorized" in msg or "126" in msg:
+            return
+        dlg = Adw.AlertDialog(heading=f"Couldn't uninstall {row.entry.name}", body=msg)
+        dlg.add_response("ok", "OK")
+        dlg.present(self)
+
+    def show_updates(self):
+        self.updates_shown = False
+        self.show("updates", self._message_page("Updates", "", "", "Checking for updates…",
+                                                "Looking at system packages, the AUR, Flatpaks and Codex.",
+                                                spinner=True))
+
+        def job():
+            result = check_updates()
+            GLib.idle_add(done, result)
+
+        def done(result):
+            self.updates = result
+            n = len(result[0])
+            self.frame.set_badge("updates", str(n) if n else "")
+            self._show_update_list(*result)
+        threading.Thread(target=job, daemon=True).start()
+
+    def _show_update_list(self, ups, errors):
+        self.updates_shown = True
+        checked = "Checked at " + time.strftime("%H:%M")
+        again = ui.button("Check again", "view-refresh-symbolic", "soft", on_click=self.show_updates)
+        notes = [ui.label(f"Couldn't check {err}", "dim", wrap=True) for err in errors]
+        if not ups:
+            page = self._message_page("Updates", checked, "object-select-symbolic", "You're up to date",
+                                      "Everything on this computer has the newest version.",
+                                      buttons=[again], extra=ui.box(True, 6, *notes) if notes else None)
+            self.show("updates", page)
+            return
+
+        page = ui.Page("Updates", f"{len(ups)} available  ·  {checked}")
+        page.actions.append(again)
+        page.actions.append(ui.button(f"Update all", "software-update-available-symbolic", "primary",
+                                      on_click=lambda: self.run_updates(ups)))
+        col = ui.box(True, 14)
+        for key, title, desc in UPDATE_SOURCES:
+            items = [u for u in ups if u.source == key]
+            if not items:
+                continue
+            c = ui.card()
+            c.set_spacing(10)
+            head = ui.box(False, 10)
+            head.append(ui.label(title, "stat-val", hexpand=True))
+            head.append(ui.label(str(len(items)), "chip"))
+            c.append(head)
+            if desc:
+                c.append(ui.label(desc, "dim", wrap=True))
+            shown, rest = items[:6], items[6:]
+
+            def rows_for(us):
+                lb = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+                lb.add_css_class("plain")
+                for u in us:
+                    r = ui.box(False, 12, margin_top=4, margin_bottom=4)
+                    r.append(ui.label(u.name, ellipsize=True, hexpand=True))
+                    r.append(ui.label(f"{u.old} → {u.new}" if u.old else u.new, "dim", "code", ellipsize=True,
+                                      xalign=1, max_width_chars=34))
+                    lb.append(r)
+                return lb
+            c.append(rows_for(shown))
+            if rest:
+                rev = Gtk.Revealer(child=rows_for(rest), transition_type=Gtk.RevealerTransitionType.SLIDE_DOWN,
+                                   transition_duration=220)
+                more = ui.button(f"Show {len(rest)} more", None, "soft", on_click=lambda: None)
+                more.set_halign(Gtk.Align.START)
+
+                def toggle(_b, rv=rev, n=len(rest)):
+                    rv.set_reveal_child(not rv.get_reveal_child())
+                    _b.set_label("Show less" if rv.get_reveal_child() else f"Show {n} more")
+                more.connect("clicked", toggle)
+                c.append(rev)
+                c.append(more)
+            col.append(c)
+        for n in notes:
+            col.append(n)
+        col.append(ui.label("You'll be asked for your password. Apps that are open keep running the old "
+                            "version until you reopen them.", "faint", wrap=True, margin_top=4))
+        page.body.append(Gtk.ScrolledWindow(child=col, vexpand=True))
+        self.show("updates", page)
+
+    def run_updates(self, ups):
+        self.busy = True
+        step_label = ui.label("Starting…", "dim", xalign=0.5)
+        tv = Gtk.TextView(editable=False, monospace=True, wrap_mode=Gtk.WrapMode.WORD_CHAR, cursor_visible=False)
+        tv.add_css_class("log")
+        buf = tv.get_buffer()
+        end = buf.create_mark(None, buf.get_end_iter(), False)
+        exp = Gtk.Expander(label="Details", child=Gtk.ScrolledWindow(child=tv, min_content_height=220))
+        page = self._message_page("Updates", f"Installing {len(ups)} updates", "", "Updating…", spinner=True,
+                                  extra=ui.box(True, 12, step_label, exp))
+        self.show("updates", page)
+
+        def log(text):
+            buf.insert(buf.get_end_iter(), text)
+            tv.scroll_mark_onscreen(end)
+
+        def job():
+            failed = []
+            for title, cmd in update_steps(ups):
+                if PACMAN_LOCK.exists() and ("pacman" in cmd or "paru" in cmd):
+                    GLib.idle_add(step_label.set_text, "Waiting for another update to finish…")
+                    for _ in range(600):
+                        if not PACMAN_LOCK.exists():
+                            break
+                        time.sleep(1)
+                GLib.idle_add(step_label.set_text, f"{title}…")
+                GLib.idle_add(log, f"\n$ {' '.join(cmd)}\n")
+                try:
+                    rc = stream(cmd, lambda line: GLib.idle_add(log, line))
+                except OSError as e:
+                    GLib.idle_add(log, f"{e}\n")
+                    rc = 1
+                if rc in (126, 127) and cmd[0] == "pkexec":
+                    failed.append((title, "The password prompt was cancelled."))
+                    break
+                if rc != 0:
+                    failed.append((title, f"exited with code {rc}"))
+            GLib.idle_add(self._updates_done, ups, failed, buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False))
+        threading.Thread(target=job, daemon=True).start()
+
+    def _updates_done(self, ups, failed, log):
+        self.busy = False
+        self.updates = None
+        if failed:
+            msg = "\n".join(f"{t}: {m}" for t, m in failed)
+            self.show_error("Some updates didn't finish", msg, log, page_name="updates")
+            return
+        self.frame.set_badge("updates", "")
+        reboot = any(u.source == "repo" and REBOOT_PKGS.match(u.name) for u in ups)
+        body = ("Restart your computer to finish – the kernel or a core part of the system was updated."
+                if reboot else "Reopen any apps that were open to use their new versions.")
+        done = ui.button("Done", None, "primary", on_click=self.finish)
+        self.show("updates", self._message_page("Updates", "", "object-select-symbolic",
+                                                "Everything is up to date", body, buttons=[done]))
+
+    def _install_page(self):
+        page = ui.Page("Install a file", ".deb, .rpm and .AppImage")
+        inner = ui.box(True, 14, halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER, vexpand=True,
+                       margin_top=34, margin_bottom=34)
+        t = ui.icon_tile("folder-download-symbolic", 72, 34)
+        t.set_halign(Gtk.Align.CENTER)
+        inner.append(t)
+        inner.append(ui.label("Drop a package here", "page-title", xalign=0.5))
+        inner.append(ui.label("Debian/Ubuntu (.deb) and Fedora (.rpm) packages are converted into a real "
+                              "Arch package. AppImages go to ~/Applications and your launcher.",
+                              "dim", xalign=0.5, wrap=True, justify=Gtk.Justification.CENTER, max_width_chars=56))
+        b = ui.button("Browse files", "document-open-symbolic", "primary", on_click=self.on_pick)
+        b.set_halign(Gtk.Align.CENTER)
+        b.set_margin_top(6)
+        inner.append(b)
+        c = ui.card(inner)
+        c.set_vexpand(True)
+        page.body.append(c)
+        page.body.append(ui.label("Only install apps from sources you trust – they get full access to your computer.",
+                                  "faint", xalign=0.5, wrap=True))
+        return page
+
+    def on_pick(self, *_):
+        dlg = Gtk.FileDialog(title="Choose a package")
+        f = Gtk.FileFilter()
+        f.set_name("Packages (.deb, .rpm, .AppImage)")
+        for pat in ("*.deb", "*.rpm", "*.AppImage", "*.appimage"):
+            f.add_pattern(pat)
+        store = Gio.ListStore(item_type=Gtk.FileFilter)
+        store.append(f)
+        dlg.set_filters(store)
+        dlg.set_initial_folder(Gio.File.new_for_path(str(HOME / "Downloads")))
+
+        def done(d, res):
+            try:
+                file = d.open_finish(res)
+            except GLib.Error:
+                return
+            self.load(file.get_path())
+        dlg.open(self, None, done)
+
+    def load(self, path):
+        if self.busy or not path:
+            return
+        try:
+            self.pkg = Pkg(path)
+        except Exception as e:
+            self.show_error("Can't open this file", str(e))
+            return
+        self.show_details()
+
+    def show_details(self):
+        p = self.pkg
+        page = ui.Page("Install a file", p.path.name)
+        c = ui.card()
+        c.set_spacing(18)
+        head = ui.box(False, 16)
+        head.append(ui.icon_tile("package-x-generic-symbolic" if p.kind != "appimage" else "application-x-executable-symbolic",
+                                 64, 30))
+        titles = ui.box(True, 4, hexpand=True, valign=Gtk.Align.CENTER)
+        titles.append(ui.label(p.name, "page-title", ellipsize=True))
+        titles.append(ui.label(p.description or FILE_KINDS[p.kind], "dim", wrap=True))
+        head.append(titles)
+        c.append(head)
+
+        chips = ui.box(False, 6)
+        for text in (FILE_KINDS[p.kind], p.version and f"v{p.version}", human(p.path.stat().st_size)):
+            if text:
+                chips.append(ui.label(text, "chip"))
+        c.append(chips)
+
+        grid = Gtk.Grid(column_spacing=10, row_spacing=10, column_homogeneous=True)
+        for i, (k, v) in enumerate((("Installs as", p.pkgname if p.kind != "appimage" else f"~/Applications/{p.name}"),
+                                    ("File", str(p.path)))):
+            cell = ui.box(True, 2, ui.label(k.upper(), "stat-key"), ui.label(v, "stat-val", ellipsize=True, selectable=True))
+            cell.add_css_class("stat")
+            grid.attach(cell, 0, i, 1, 1)
+        c.append(grid)
+
+        installed = self.pkg.installed()
+        buttons = ui.box(False, 10, halign=Gtk.Align.END)
+        if installed:
+            buttons.append(ui.button("Uninstall", "user-trash-symbolic", "soft", "danger",
+                                     on_click=lambda: self.work("uninstall")))
+        else:
+            buttons.append(ui.button("Cancel", None, "soft", on_click=self.finish))
+        buttons.append(ui.button("Reinstall" if installed else "Install", None, "primary",
+                                 on_click=lambda: self.work("install")))
+        c.append(buttons)
+        page.body.append(c)
+        page.body.append(ui.label("Only install apps from sources you trust – they get full access to your computer.",
+                                  "faint", wrap=True))
+        self.show("install", page)
+
+    def show_progress(self, text):
+        self.busy = True
+        self.step_label = ui.label(text, "dim", xalign=0.5)
+        self.show("install", self._message_page("Install a file", self.pkg.path.name, "", self.pkg.name,
+                                                spinner=True, extra=self.step_label))
+
+    def show_done(self, inst, action):
+        self.busy = False
+        p = self.pkg
+        if action == "uninstall":
+            self.show("install", self._message_page("Install a file", "", "user-trash-symbolic", f"{p.name} removed",
+                                                    buttons=[ui.button("Done", None, "primary", on_click=self.finish)]))
+            return
+        extra = None
+        if inst.missing_libs:
+            extra = ui.box(True, 6)
+            extra.append(ui.label("Missing libraries – the app may not start until these are installed:", "dim", wrap=True))
+            for lib in inst.missing_libs[:8]:
+                extra.append(ui.label(lib, "code", "chip"))
+        buttons = [ui.button("Done", None, "soft", on_click=self.finish)]
+        if inst.desktop_id:
+            buttons.append(ui.button("Open", None, "primary", on_click=lambda: self.launch(inst.desktop_id)))
+        self.show("install", self._message_page("Install a file", "", "object-select-symbolic", f"{p.name} is installed",
+                                                "You'll find it in your app launcher.", buttons=buttons, extra=extra))
+
+    def show_error(self, title, message, log=None, page_name="install"):
+        self.busy = False
+        extra = None
+        if log:
+            tv = Gtk.TextView(editable=False, monospace=True, wrap_mode=Gtk.WrapMode.WORD_CHAR)
+            tv.add_css_class("log")
+            tv.get_buffer().set_text(log[-6000:])
+            extra = Gtk.Expander(label="Details", child=Gtk.ScrolledWindow(child=tv, min_content_height=180))
+        self.show(page_name, self._message_page({"install": "Install a file", "updates": "Updates"}[page_name],
+                                                "", "dialog-warning-symbolic", title, message, extra=extra,
+                                                buttons=[ui.button("Close", None, "soft", on_click=self.finish)]))
+
+    def launch(self, desktop_id):
+        info = Gio.DesktopAppInfo.new(desktop_id)
+        if info is None:
+            subprocess.Popen(["gtk-launch", desktop_id.removesuffix(".desktop")])
+        else:
+            info.launch([], None)
+        self.finish()
+
+    def work(self, action):
+        self.show_progress("Starting…")
+
+        def step(text):
+            GLib.idle_add(self.step_label.set_text, text)
+
+        inst = Installer(self.pkg, step)
+
+        def job():
+            try:
+                getattr(inst, action)()
+            except Exception as e:
+                msg = str(e)
+                if "Request dismissed" in msg or "Not authorized" in msg or "126" in msg:
+                    msg = "The password prompt was cancelled."
+                GLib.idle_add(self.show_error, "Something went wrong", msg, "\n".join(inst.log))
+                return
+            GLib.idle_add(self.show_done, inst, action)
+        threading.Thread(target=job, daemon=True).start()
+
+class App(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.HANDLES_OPEN | Gio.ApplicationFlags.NON_UNIQUE)
+
+    def do_startup(self):
+        Adw.Application.do_startup(self)
+        ui.install()
+
+    def do_activate(self):
+        Window(self, None).present()
+
+    def do_open(self, files, _n, _hint):
+        for f in files:
+            Window(self, f.get_path()).present()
+
+if __name__ == "__main__":
+    sys.exit(App().run(sys.argv))

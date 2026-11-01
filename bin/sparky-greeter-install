@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+sudo() { command sudo ${SUDO_ASKPASS:+-A} "$@"; }
+
+src="$HOME/.config/quickshell/sparky-greeter"
+assets="$src/assets"
+dest=/etc/sparky-greeter
+session=/usr/local/bin/sparky-greeter-session
+greetd=/etc/greetd/config.toml
+
+if [ "${1:-}" = --revert ]; then
+    [ -f "$greetd.bak-sparky" ] || { echo "no backup at $greetd.bak-sparky"; exit 1; }
+    sudo cp "$greetd.bak-sparky" "$greetd"
+    echo "greetd is back on its previous greeter (takes effect next login screen)"
+    exit 0
+fi
+
+mkdir -p "$assets"
+current=$(python3 -I -c 'import json,os; print(json.load(open(os.path.expanduser("~/.config/sparky/wallpapers.json")))["current"])')
+lower=${current,,}
+
+if [ "$(cat "$assets/source" 2>/dev/null)" != "$current" ]; then
+    echo "wallpaper: $current"
+    rm -f "$assets"/wallpaper.*
+    ffmpeg -v error -y -ss 1 -i "$current" -frames:v 1 -vf "scale=-2:1080" -q:v 3 "$assets/wallpaper.jpg" ||
+        ffmpeg -v error -y -i "$current" -frames:v 1 -vf "scale=-2:1080" -q:v 3 "$assets/wallpaper.jpg"
+    video=false
+    case "$lower" in
+    *.mp4|*.gif)
+        ffmpeg -v error -y -i "$current" -an -vf "scale=-2:1080,format=yuv420p" \
+            -c:v libx264 -preset veryfast -crf 23 -movflags +faststart "$assets/wallpaper.mp4"
+        video=true ;;
+    esac
+    printf '{ "video": %s }\n' "$video" > "$assets/config.json"
+    printf %s "$current" > "$assets/source"
+fi
+
+rm -f "$assets/avatar.png"
+for f in "$HOME/.face" "$HOME/.face.icon" "/var/lib/AccountsService/icons/$USER"; do
+    [ -f "$f" ] && { ffmpeg -v error -y -i "$f" -vf "scale=512:512:force_original_aspect_ratio=increase,crop=512:512" "$assets/avatar.png"; break; }
+done
+
+font=$(fc-list : file family | grep -m1 'Google Sans Flex' | cut -d: -f1 || true)
+[ -n "$font" ] && cp -f "$font" "$assets/GoogleSansFlex.ttf"
+
+[ "${1:-}" = --assets ] && { echo "assets refreshed in $assets"; exit 0; }
+
+sudo install -d -m 755 "$dest"
+sudo rm -rf "${dest:?}"/*
+sudo cp -rL "$src"/. "$dest"/
+sudo rm -f "$dest/assets/source"
+sudo chmod -R a+rX "$dest"
+
+sudo install -d -m 755 -o greeter -g greeter /var/lib/sparky-greeter
+
+sudo tee "$session" >/dev/null <<'EOF'
+#!/bin/sh
+# greetd's greeter: sparky's login screen (Quickshell) inside the cage kiosk
+# compositor. If it can't start, the previous greeter takes over so login
+# still works. Log: /var/lib/sparky-greeter/greeter.log
+export HOME=/var/lib/sparky-greeter
+export XDG_CACHE_HOME="$HOME/.cache" XDG_STATE_HOME="$HOME/.local/state"
+if [ -z "${XDG_RUNTIME_DIR:-}" ] || [ ! -w "$XDG_RUNTIME_DIR" ]; then
+    XDG_RUNTIME_DIR="/tmp/sparky-greeter-runtime-$(id -u)"
+    mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
+    export XDG_RUNTIME_DIR
+fi
+export XCURSOR_THEME=breeze_cursors XCURSOR_SIZE=24 QT_QPA_PLATFORM=wayland
+unset WAYLAND_DISPLAY DISPLAY
+
+exec >"$HOME/greeter.log" 2>&1
+start=$(date +%s)
+dbus-run-session -- cage -s -d -- qs -p /etc/sparky-greeter
+rc=$?
+echo "greeter exited: $rc"
+if [ "$rc" -ne 0 ] && [ $(( $(date +%s) - start )) -lt 15 ] && [ -x /usr/bin/noctalia-greeter-session ]; then
+    exec /usr/bin/noctalia-greeter-session
+fi
+exit "$rc"
+EOF
+sudo chmod 755 "$session"
+
+[ -f "$greetd.bak-sparky" ] || sudo cp "$greetd" "$greetd.bak-sparky"
+sudo tee "$greetd" >/dev/null <<EOF
+[terminal]
+vt = 1
+
+[default_session]
+command = "$session"
+user = "greeter"
+EOF
+
+echo "installed: greetd now runs $session (previous config: $greetd.bak-sparky)"

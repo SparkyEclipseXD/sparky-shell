@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+import fcntl
+import hashlib
+import json
+import os
+import struct
+import subprocess
+import sys
+import time
+
+DIR = os.path.expanduser("~/.local/share/sparky/clipboard")
+INDEX = os.path.join(DIR, "index.json")
+MAX_ENTRIES = 150
+MAX_BYTES = 32 * 1024 * 1024
+
+IMAGE_TYPES = [
+    (b"\x89PNG\r\n\x1a\n", "png", "image/png"),
+    (b"\xff\xd8\xff", "jpg", "image/jpeg"),
+    (b"GIF8", "gif", "image/gif"),
+    (b"BM", "bmp", "image/bmp"),
+]
+
+def image_kind(data):
+    for magic, ext, mime in IMAGE_TYPES:
+        if data.startswith(magic):
+            return ext, mime
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp", "image/webp"
+    return None
+
+def image_size(data, ext):
+    try:
+        if ext == "png":
+            return struct.unpack(">II", data[16:24])
+        if ext == "gif":
+            return struct.unpack("<HH", data[6:10])
+    except struct.error:
+        pass
+    return 0, 0
+
+def load():
+    try:
+        with open(INDEX) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return []
+
+def save(entries):
+    tmp = INDEX + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(entries, f)
+    os.replace(tmp, INDEX)
+
+def drop_files(entries):
+    for e in entries:
+        try:
+            os.unlink(os.path.join(DIR, e["file"]))
+        except OSError:
+            pass
+
+IMAGE_PREFERENCE = ["image/png", "image/jpeg", "image/webp", "image/gif", "image/bmp"]
+
+def fetch_image():
+    try:
+        types = subprocess.run(["wl-paste", "--list-types"], capture_output=True,
+                               text=True, timeout=2).stdout.split()
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    mime = next((t for t in IMAGE_PREFERENCE if t in types), None)
+    if not mime:
+        return None
+    try:
+        data = subprocess.run(["wl-paste", "--no-newline", "--type", mime],
+                              capture_output=True, timeout=5).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return data if image_kind(data) else None
+
+def store():
+    if os.environ.get("CLIPBOARD_STATE") in ("sensitive", "clear", "nil"):
+        return
+    data = sys.stdin.buffer.read(MAX_BYTES + 1)
+    image_data = fetch_image()
+    if image_data:
+        data = image_data
+    if not data or len(data) > MAX_BYTES:
+        return
+
+    img = image_kind(data)
+    if img:
+        ext, mime = img
+        entry = {"kind": "image", "mime": mime}
+        w, h = image_size(data, ext)
+        if w:
+            entry.update(width=w, height=h)
+    else:
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            return
+        if not text.strip():
+            return
+        ext = "txt"
+        entry = {"kind": "text", "mime": "", "text": text[:400], "lines": text.count("\n") + 1}
+
+    digest = hashlib.sha1(data).hexdigest()[:16]
+    entry.update(id=digest, file=f"{digest}.{ext}", time=int(time.time()))
+
+    entries = load()
+    entries = [e for e in entries if e["id"] != digest]
+    path = os.path.join(DIR, entry["file"])
+    if not os.path.exists(path):
+        with open(path, "wb") as f:
+            f.write(data)
+    entries.insert(0, entry)
+    drop_files(entries[MAX_ENTRIES:])
+    save(entries[:MAX_ENTRIES])
+
+def copy(eid):
+    entry = next((e for e in load() if e["id"] == eid), None)
+    if not entry:
+        return
+    cmd = ["wl-copy"] + (["--type", entry["mime"]] if entry["mime"] else [])
+    with open(os.path.join(DIR, entry["file"]), "rb") as f:
+        subprocess.run(cmd, stdin=f)
+
+def delete(eid):
+    entries = load()
+    drop_files([e for e in entries if e["id"] == eid])
+    save([e for e in entries if e["id"] != eid])
+
+def clear():
+    drop_files(load())
+    save([])
+
+def main():
+    os.makedirs(DIR, exist_ok=True)
+    cmd, args = (sys.argv[1] if len(sys.argv) > 1 else ""), sys.argv[2:]
+    if cmd == "copy":
+        return copy(*args)
+    with open(os.path.join(DIR, ".lock"), "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if cmd == "store":
+            store()
+        elif cmd == "delete":
+            delete(*args)
+        elif cmd == "clear":
+            clear()
+        else:
+            sys.exit(__doc__)
+
+main()

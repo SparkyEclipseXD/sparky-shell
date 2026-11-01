@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+import itertools
+import json
+import os
+import subprocess
+import sys
+
+import dbus
+import dbus.service
+from dbus.mainloop.glib import DBusGMainLoop
+from gi.repository import GLib
+
+sys.path.insert(0, os.path.expanduser("~/.local/lib/sparky"))
+import qtstream
+
+NAME = "org.freedesktop.impl.portal.desktop.sparky"
+KDE = "org.freedesktop.impl.portal.desktop.kde"
+PATH = "/org/freedesktop/portal/desktop"
+IFACE = "org.freedesktop.impl.portal.ScreenCast"
+APPCHOOSER = "org.freedesktop.impl.portal.AppChooser"
+PICK_TIMEOUT_S = 120
+
+DBusGMainLoop(set_as_default=True)
+bus = dbus.SessionBus()
+
+def kde():
+    return dbus.Interface(bus.get_object(KDE, PATH), IFACE)
+
+def kde_appchooser():
+    return dbus.Interface(bus.get_object(KDE, PATH), APPCHOOSER)
+
+def log(*a):
+    print("sparky-portal:", *a, file=sys.stderr, flush=True)
+
+def sv(d):
+    return dbus.Dictionary(d, signature="sv")
+
+class Session(dbus.service.Object):
+
+    def __init__(self, path):
+        super().__init__(bus, path)
+        self.path = path
+        bus.add_signal_receiver(self._kde_closed, "Closed", "org.freedesktop.impl.portal.Session", KDE, path)
+
+    @dbus.service.method("org.freedesktop.impl.portal.Session")
+    def Close(self):
+        try:
+            dbus.Interface(bus.get_object(KDE, self.path), "org.freedesktop.impl.portal.Session").Close()
+        except dbus.DBusException as e:
+            log("close:", e)
+        self._drop()
+
+    @dbus.service.signal("org.freedesktop.impl.portal.Session")
+    def Closed(self):
+        pass
+
+    def _kde_closed(self):
+        self.Closed()
+        self._drop()
+
+    def _drop(self):
+        sessions.pop(self.path, None)
+        try:
+            self.remove_from_connection()
+        except LookupError:
+            pass
+
+sessions = {}
+pending = {}
+choosers = {}
+ids = itertools.count(1)
+
+class Backend(dbus.service.Object):
+    def __init__(self):
+        super().__init__(bus, PATH)
+
+    @dbus.service.method(dbus.PROPERTIES_IFACE, in_signature="ss", out_signature="v")
+    def Get(self, interface, prop):
+        return dbus.Interface(bus.get_object(KDE, PATH), dbus.PROPERTIES_IFACE).Get(interface, prop)
+
+    @dbus.service.method(dbus.PROPERTIES_IFACE, in_signature="s", out_signature="a{sv}")
+    def GetAll(self, interface):
+        return dbus.Interface(bus.get_object(KDE, PATH), dbus.PROPERTIES_IFACE).GetAll(interface)
+
+    @dbus.service.method(IFACE, in_signature="oosa{sv}", out_signature="ua{sv}")
+    def CreateSession(self, handle, session_handle, app_id, options):
+        r, res = kde().CreateSession(handle, session_handle, app_id, options)
+        if r == 0 and session_handle not in sessions:
+            sessions[str(session_handle)] = Session(session_handle)
+        return r, res
+
+    @dbus.service.method(IFACE, in_signature="oosa{sv}", out_signature="ua{sv}",
+                         async_callbacks=("reply", "error"))
+    def SelectSources(self, handle, session_handle, app_id, options, reply, error):
+        def forward(opts):
+            try:
+                reply(*kde().SelectSources(handle, session_handle, app_id, sv(opts)))
+            except dbus.DBusException as e:
+                error(e)
+
+        opts = dict(options)
+        log("select sources for", app_id, "session known:", str(session_handle) in sessions, "options:", list(opts))
+        if str(session_handle) not in sessions or "restore_data" in opts:
+            return forward(opts)
+
+        def answered(answer):
+            if answer is None:
+                return forward(opts)
+            if answer.get("cancel"):
+                return reply(dbus.UInt32(1), sv({}))
+            payload = qtstream.kde_restore_payload(outputs=answer.get("outputs", ()),
+                                                   windows=[tuple(w) for w in answer.get("windows", ())])
+            opts["restore_data"] = dbus.Struct(
+                (dbus.String("KDE"), dbus.UInt32(1), dbus.ByteArray(payload, variant_level=1)),
+                signature="suv", variant_level=1)
+            forward(opts)
+
+        types = int(opts.get("types", 1)) or 1
+        ask(app_id, types, bool(opts.get("multiple", False)), answered)
+
+    @dbus.service.method(IFACE, in_signature="oossa{sv}", out_signature="ua{sv}",
+                         async_callbacks=("reply", "error"))
+    def Start(self, handle, session_handle, app_id, parent_window, options, reply, error):
+        kde().Start(handle, session_handle, app_id, parent_window, options,
+                    reply_handler=lambda r, res: reply(r, res), error_handler=error, timeout=600)
+
+    @dbus.service.method(APPCHOOSER, in_signature="ossasa{sv}", out_signature="ua{sv}",
+                         async_callbacks=("reply", "error"))
+    def ChooseApplication(self, handle, app_id, parent_window, choices, options, reply, error):
+        opts = dict(options)
+
+        def to_kde():
+            kde_appchooser().ChooseApplication(handle, app_id, parent_window, choices, sv(opts),
+                                               reply_handler=lambda r, res: reply(r, res),
+                                               error_handler=error, timeout=24 * 3600)
+
+        type_name, type_icon = describe_type(str(opts.get("content_type", "")))
+        state = {"rid": None, "request": None}
+
+        def answered(answer):
+            if state["request"]:
+                state["request"].drop()
+            if answer is None:
+                return to_kde()
+            if answer.get("cancel") or not answer.get("choice"):
+                return reply(dbus.UInt32(1), sv({}))
+            res = {"choice": dbus.String(answer["choice"])}
+            if opts.get("activation_token"):
+                res["activation_token"] = opts["activation_token"]
+            reply(dbus.UInt32(0), sv(res))
+
+        state["rid"] = open_picker("appchooser", {
+            "app": app_name(app_id), "choices": [str(c) for c in choices],
+            "last": str(opts.get("last_choice", "")), "file": file_label(opts),
+            "contentType": str(opts.get("content_type", "")), "typeName": type_name, "typeIcon": type_icon,
+        }, answered)
+        choosers[str(handle)] = state["rid"]
+
+        def cancel():
+            cb = pending.pop(state["rid"], None)
+            subprocess.run(["qs", "-c", "sparky", "ipc", "call", "appchooser", "close"], capture_output=True)
+            if cb:
+                reply(dbus.UInt32(2), sv({}))
+        try:
+            state["request"] = Request(handle, cancel)
+        except KeyError:
+            pass
+
+    @dbus.service.method(APPCHOOSER, in_signature="oas")
+    def UpdateChoices(self, handle, choices):
+        rid = choosers.get(str(handle))
+        if rid in pending:
+            subprocess.run(["qs", "-c", "sparky", "ipc", "call", "appchooser", "update",
+                            json.dumps({"id": rid, "choices": [str(c) for c in choices]})], capture_output=True)
+        else:
+            try:
+                kde_appchooser().UpdateChoices(handle, choices)
+            except dbus.DBusException:
+                pass
+
+    @dbus.service.method("org.sparky.ScreenShare", in_signature="us")
+    def Answer(self, request, data):
+        cb = pending.pop(int(request), None)
+        if cb:
+            try:
+                cb(json.loads(data))
+            except ValueError:
+                cb(None)
+
+def app_name(app_id):
+    if not app_id:
+        return ""
+    from gi.repository import Gio
+    for cand in (app_id, app_id.split(".")[-1], app_id.lower()):
+        try:
+            info = Gio.DesktopAppInfo.new(cand + ".desktop")
+        except TypeError:
+            info = None
+        if info:
+            return info.get_display_name()
+    return app_id.split(".")[-1].capitalize()
+
+def ask(app_id, types, multiple, done):
+    return open_picker("screenshare", {"app": app_name(app_id), "appId": app_id, "monitors": bool(types & 1),
+                                       "windows": bool(types & 2), "multiple": multiple}, done)
+
+def open_picker(target, request, done):
+    rid = next(ids)
+    pending[rid] = done
+    request = json.dumps(dict(request, id=rid))
+    try:
+        r = subprocess.run(["qs", "-c", "sparky", "ipc", "call", target, "open", request],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode != 0:
+            raise RuntimeError(r.stderr.strip() or "ipc failed")
+    except Exception as e:
+        log("picker unavailable, using KDE's dialog:", e)
+        pending.pop(rid, None)
+        return done(None)
+
+    def give_up():
+        cb = pending.pop(rid, None)
+        if cb:
+            cb({"cancel": True})
+        return False
+    GLib.timeout_add_seconds(PICK_TIMEOUT_S, give_up)
+    return rid
+
+class Request(dbus.service.Object):
+
+    def __init__(self, path, on_close):
+        super().__init__(bus, path)
+        self.on_close = on_close
+
+    @dbus.service.method("org.freedesktop.impl.portal.Request")
+    def Close(self):
+        self.on_close()
+        self.drop()
+
+    def drop(self):
+        try:
+            self.remove_from_connection()
+        except LookupError:
+            pass
+
+def file_label(options):
+    name = str(options.get("filename", "") or "")
+    uri = str(options.get("uri", "") or "")
+    if not name and uri:
+        from urllib.parse import unquote, urlparse
+        u = urlparse(uri)
+        name = os.path.basename(unquote(u.path)) if u.scheme == "file" else (u.netloc or uri)
+    return name
+
+def describe_type(content_type):
+    if not content_type:
+        return "", "text-x-generic"
+    from gi.repository import Gio
+    return Gio.content_type_get_description(content_type) or content_type, \
+        Gio.content_type_get_generic_icon_name(content_type) or "text-x-generic"
+
+name = dbus.service.BusName(NAME, bus, do_not_queue=True)
+Backend()
+log("ready")
+GLib.MainLoop().run()

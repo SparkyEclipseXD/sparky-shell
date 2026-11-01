@@ -1,0 +1,11 @@
+{
+    "KPackageStructure": "Plasma/LookAndFeel",
+    "KPlugin": {
+        "Id": "sparky.splash",
+        "Name": "Sparky Splash",
+        "Description": "The bridge from sparky's login screen to the desktop: your wallpaper fades in from black, blurred, with a welcome; when the desktop is ready it sharpens and gets out of the way.",
+        "License": "GPL-3.0-or-later",
+        "Version": "1.0.0"
+    },
+    "X-Plasma-APIVersion": "2"
+}

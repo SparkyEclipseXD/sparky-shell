@@ -1,0 +1,141 @@
+#!/usr/bin/env python3
+import configparser
+import json
+import os
+import re
+
+HOME = os.path.expanduser("~")
+DATA_DIRS = [os.environ.get("XDG_DATA_HOME", f"{HOME}/.local/share")] + \
+    os.environ.get("XDG_DATA_DIRS", "/usr/local/share:/usr/share").split(":") + \
+    [f"{HOME}/.local/share/flatpak/exports/share", "/var/lib/flatpak/exports/share"]
+DATA_DIRS = list(dict.fromkeys(d for d in DATA_DIRS if os.path.isdir(d)))
+OUT = f"{HOME}/.cache/sparky/icons.json"
+EXTS = (".svg", ".png", ".xpm")
+
+def theme_chain():
+    theme = "breeze-dark"
+    try:
+        c = configparser.RawConfigParser(strict=False)
+        c.read(f"{HOME}/.config/kdeglobals")
+        theme = c.get("Icons", "Theme", fallback=theme)
+    except Exception:
+        pass
+    chain, todo = [], [theme]
+    while todo:
+        t = todo.pop(0)
+        if t in chain:
+            continue
+        chain.append(t)
+        for base in [f"{HOME}/.icons"] + [f"{d}/icons" for d in DATA_DIRS]:
+            idx = f"{base}/{t}/index.theme"
+            if os.path.exists(idx):
+                c = configparser.RawConfigParser(strict=False)
+                try:
+                    c.read(idx)
+                    todo += [x.strip() for x in c.get("Icon Theme", "Inherits", fallback="").split(",") if x.strip()]
+                except Exception:
+                    pass
+                break
+    if "hicolor" in chain:
+        chain.remove("hicolor")
+    return chain + ["hicolor"]
+
+def rank(path):
+    if path.endswith(".svg"):
+        return 10000
+    m = re.search(r"/(\d+)x\d+(@\d+)?/", path)
+    size = int(m.group(1)) if m else 48
+    return 5000 - abs(128 - size) + size / 1000
+
+def index_icons():
+    best = {}
+    roots = [f"{HOME}/.icons"] + [f"{d}/icons" for d in DATA_DIRS]
+    for theme in theme_chain():
+        found = {}
+        for root in roots:
+            tdir = f"{root}/{theme}"
+            if not os.path.isdir(tdir):
+                continue
+            seen_dirs = set()
+            for dirpath, dirs, files in os.walk(tdir, followlinks=True):
+                real = os.path.realpath(dirpath)
+                if real in seen_dirs:
+                    dirs[:] = []
+                    continue
+                seen_dirs.add(real)
+                if "/symbolic" in dirpath or "/actions" in dirpath or "/status" in dirpath:
+                    continue
+                for f in files:
+                    if not f.endswith(EXTS):
+                        continue
+                    name = f.rsplit(".", 1)[0]
+                    p = os.path.join(dirpath, f)
+                    if name not in found or rank(p) > rank(found[name]):
+                        found[name] = p
+        for name, p in found.items():
+            best.setdefault(name, p)
+    for root in [f"{d}/pixmaps" for d in DATA_DIRS]:
+        if os.path.isdir(root):
+            for f in os.listdir(root):
+                if f.endswith(EXTS):
+                    best.setdefault(f.rsplit(".", 1)[0], os.path.join(root, f))
+    return best
+
+def desktop_entries():
+    seen = set()
+    for d in DATA_DIRS:
+        adir = f"{d}/applications"
+        if not os.path.isdir(adir):
+            continue
+        for dirpath, _dirs, files in os.walk(adir):
+            for f in files:
+                if not f.endswith(".desktop"):
+                    continue
+                did = os.path.relpath(os.path.join(dirpath, f), adir)[:-8].replace("/", "-")
+                if did in seen:
+                    continue
+                seen.add(did)
+                c = configparser.RawConfigParser(strict=False, interpolation=None)
+                try:
+                    c.read(os.path.join(dirpath, f))
+                    yield did, c["Desktop Entry"]
+                except Exception:
+                    continue
+
+def main():
+    icons = index_icons()
+
+    def resolve(icon):
+        if not icon:
+            return None
+        if icon.startswith("/"):
+            return icon if os.path.exists(icon) else None
+        return icons.get(icon) or icons.get(icon.lower())
+
+    apps = {}
+
+    def add(key, path):
+        if key:
+            apps.setdefault(key.lower(), path)
+
+    entries = [(did, e, resolve(e.get("Icon", ""))) for did, e in desktop_entries()]
+    entries = [x for x in entries if x[2]]
+    for did, e, path in entries:
+        add(did, path)
+        add(e.get("StartupWMClass", ""), path)
+    for did, e, path in entries:
+        add(did.rsplit(".", 1)[-1], path)
+        icon = e.get("Icon", "")
+        add(icon if not icon.startswith("/") else "", path)
+    for did, e, path in entries:
+        exe = e.get("Exec", "").split()
+        if exe and exe[0] not in ("env", "sh", "bash", "flatpak", "kitty", "alacritty", "konsole", "wine", "steam"):
+            add(os.path.basename(exe[0].strip('"')), path)
+
+    os.makedirs(os.path.dirname(OUT), exist_ok=True)
+    tmp = OUT + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"apps": apps}, f)
+    os.replace(tmp, OUT)
+
+main()

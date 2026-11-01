@@ -1,0 +1,12 @@
+{
+    "KPackageStructure": "KWin/Script",
+    "KPlugin": {
+        "Authors": [{ "Name": "Sparky" }],
+        "Description": "The window you switch to (Alt+Tab, taskbar, click) goes over everything, keep-above windows included",
+        "EnabledByDefault": true,
+        "Id": "sparky-raise",
+        "License": "GPL",
+        "Name": "Sparky: active window on top"
+    },
+    "X-Plasma-API": "javascript"
+}

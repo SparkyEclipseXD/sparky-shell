@@ -1,0 +1,741 @@
+#!/usr/bin/env python3
+import glob
+import math
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+from collections import deque
+
+import psutil
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango
+
+sys.path.insert(0, os.path.expanduser("~/.local/lib/sparky"))
+import sparkyui as ui
+
+APP_ID = "dev.sparky.TaskManager"
+HISTORY = 60
+TICK_MS = 1000
+NCPU = psutil.cpu_count() or 1
+MY_UID = os.getuid()
+
+def fmt_bytes(n, digits=1):
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(n) < 1024 or unit == "TB":
+            return f"{n:.0f} {unit}" if unit in ("B", "KB") else f"{n:.{digits}f} {unit}"
+        n /= 1024
+
+def fmt_rate(n):
+    return fmt_bytes(n) + "/s"
+
+def read(path, cast=str, default=None):
+    try:
+        with open(path) as f:
+            return cast(f.read().strip())
+    except (OSError, ValueError):
+        return default
+
+def cpu_model():
+    for line in open("/proc/cpuinfo"):
+        if line.startswith("model name"):
+            return line.split(":", 1)[1].strip()
+    return "CPU"
+
+def find_gpu():
+    best, best_vram = None, 0
+    for dev in glob.glob("/sys/class/drm/card[0-9]*/device"):
+        vram = read(f"{dev}/mem_info_vram_total", int, 0)
+        if vram > best_vram:
+            best, best_vram = dev, vram
+    if not best:
+        return None, None
+    name = None
+    dev_id = read(f"{best}/device", str, "")[2:].upper()
+    rev = read(f"{best}/revision", str, "")[2:].upper()
+    for ids in ("/usr/share/libdrm/amdgpu.ids",):
+        try:
+            for line in open(ids):
+                parts = [p.strip() for p in line.split(",", 2)]
+                if len(parts) == 3 and parts[0].upper() == dev_id and parts[1].upper() == rev:
+                    name = parts[2]
+                    break
+        except OSError:
+            pass
+    if not name:
+        try:
+            slot = os.path.basename(os.path.realpath(best))
+            out = subprocess.run(["lspci", "-s", slot], capture_output=True, text=True).stdout
+            m = re.search(r"\[([^\]]+)\][^\[]*$", out)
+            name = m.group(1) if m else "GPU"
+        except OSError:
+            name = "GPU"
+    return best, name
+
+def app_icons():
+    icons = {}
+    for info in Gio.AppInfo.get_all():
+        icon = info.get_icon()
+        if icon is None:
+            continue
+        keys = {info.get_id().removesuffix(".desktop").lower().split(".")[-1]}
+        exe = (info.get_executable() or "").split("/")[-1].lower()
+        if exe and exe not in ("env", "sh", "bash", "flatpak", "python3", "python"):
+            keys.add(exe)
+        wm_class = getattr(info, "get_startup_wm_class", lambda: None)()
+        if wm_class:
+            keys.add(wm_class.lower())
+        for k in keys:
+            icons.setdefault(k, icon)
+    return icons
+
+SORT_PRESETS = (
+    ("Most CPU", "cpu", True), ("Least CPU", "cpu", False),
+    ("Most memory", "mem", True), ("Least memory", "mem", False),
+    ("Name A–Z", "name", False), ("Name Z–A", "name", True),
+    ("Newest first", "pid", True), ("Oldest first", "pid", False),
+    ("Most threads", "threads", True), ("Fewest threads", "threads", False),
+)
+
+class ProcItem(GObject.Object):
+    __gtype_name__ = "ProcItem"
+    name = GObject.Property(type=str, default="")
+    pid = GObject.Property(type=int, default=0)
+    uid = GObject.Property(type=int, default=-1)
+    user = GObject.Property(type=str, default="")
+    cpu = GObject.Property(type=float, default=0.0)
+    mem = GObject.Property(type=float, default=0.0)
+    threads = GObject.Property(type=int, default=0)
+    icon = GObject.Property(type=Gio.Icon)
+
+class Graph(Gtk.DrawingArea):
+    SERIES = ((0.95, 0.95, 0.95), (0.55, 0.55, 0.58))
+
+    def __init__(self, maxv=100.0, series=1, height=120, spark=False):
+        super().__init__()
+        self.maxv = maxv
+        self.spark = spark
+        self.data = [deque(maxlen=HISTORY + 1) for _ in range(series)]
+        self.top = maxv or 1.0
+        self.pushed = 0.0
+        self.set_content_height(height)
+        self.set_hexpand(True)
+        self.set_draw_func(self._draw)
+        self.add_tick_callback(self._frame)
+
+    def push(self, *values):
+        for series, v in zip(self.data, values):
+            series.append(float(v))
+        self.pushed = GLib.get_monotonic_time() / 1e6
+
+    def _frame(self, _w, _clock):
+        if self.get_mapped():
+            if not self.maxv:
+                want = max(1.0, max((max(s) for s in self.data if s), default=1.0) * 1.2)
+                self.top += (want - self.top) * 0.12
+            self.queue_draw()
+        return GLib.SOURCE_CONTINUE
+
+    def _path(self, cr, pts):
+        cr.move_to(*pts[0])
+        for i in range(1, len(pts)):
+            p0, p1, p2 = pts[max(i - 2, 0)], pts[i - 1], pts[i]
+            p3 = pts[min(i + 1, len(pts) - 1)]
+            lo, hi = min(p1[1], p2[1]), max(p1[1], p2[1])
+            c1y = min(hi, max(lo, p1[1] + (p2[1] - p0[1]) / 6))
+            c2y = min(hi, max(lo, p2[1] - (p3[1] - p1[1]) / 6))
+            cr.curve_to(p1[0] + (p2[0] - p0[0]) / 6, c1y, p2[0] - (p3[0] - p1[0]) / 6, c2y, p2[0], p2[1])
+
+    def _draw(self, _area, cr, w, h):
+        import cairo
+        if not self.spark:
+            cr.set_line_width(1)
+            cr.set_source_rgba(1, 1, 1, 0.05)
+            for i in range(1, 4):
+                y = round(h * i / 4) + 0.5
+                cr.move_to(0, y)
+                cr.line_to(w, y)
+            cr.stroke()
+
+        phase = min(1.0, (GLib.get_monotonic_time() / 1e6 - self.pushed) / (TICK_MS / 1000))
+        phase = 1 - (1 - phase) ** 3
+        step = w / (HISTORY - 1)
+        top = self.top
+        pad = 2
+        for idx, (series, (r, g, b)) in enumerate(zip(self.data, self.SERIES)):
+            if len(series) < 2:
+                continue
+            start = HISTORY + 1 - len(series)
+            pts = [((start + i - phase) * step, h - pad - min(v / top, 1.0) * (h - 2 * pad))
+                   for i, v in enumerate(series)]
+            cr.save()
+            cr.rectangle(0, 0, w, h)
+            cr.clip()
+            self._path(cr, pts)
+            cr.set_source_rgba(r, g, b, 0.95 if idx == 0 else 0.8)
+            cr.set_line_width(1.4 if self.spark else 2.0)
+            cr.set_line_join(cairo.LINE_JOIN_ROUND)
+            cr.stroke_preserve()
+            cr.line_to(pts[-1][0], h)
+            cr.line_to(pts[0][0], h)
+            cr.close_path()
+            grad = cairo.LinearGradient(0, 0, 0, h)
+            grad.add_color_stop_rgba(0, r, g, b, 0.20 if idx == 0 else 0.10)
+            grad.add_color_stop_rgba(1, r, g, b, 0.0)
+            cr.set_source(grad)
+            cr.fill()
+            cr.restore()
+
+class Bar(Gtk.DrawingArea):
+
+    def __init__(self):
+        super().__init__()
+        self.value = 0.0
+        self.set_content_width(38)
+        self.set_content_height(6)
+        self.set_valign(Gtk.Align.CENTER)
+        self.set_draw_func(self._draw)
+
+    def set(self, v):
+        v = max(0.0, min(1.0, v))
+        if abs(v - self.value) > 0.003:
+            self.value = v
+            self.queue_draw()
+
+    def _draw(self, _a, cr, w, h):
+        def pill(x, width):
+            r = h / 2
+            cr.new_sub_path()
+            cr.arc(x + r, r, r, math.pi / 2, 3 * math.pi / 2)
+            cr.arc(x + max(width, h) - r, r, r, -math.pi / 2, math.pi / 2)
+            cr.close_path()
+        pill(0, w)
+        cr.set_source_rgba(1, 1, 1, 0.08)
+        cr.fill()
+        if self.value > 0.004:
+            pill(0, max(h, w * self.value))
+            cr.set_source_rgba(1, 1, 1, 0.35 + 0.6 * self.value)
+            cr.fill()
+
+class PerfTile(Gtk.Box):
+
+    def __init__(self, title, on_pick, series=1, maxv=100.0):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self.add_css_class("card")
+        self.add_css_class("hoverable")
+        head = ui.box(False, 8)
+        head.append(ui.label(title, "stat-val", hexpand=True))
+        self.value = ui.label("–", "dim", "mono", xalign=1)
+        head.append(self.value)
+        self.append(head)
+        self.spark = Graph(maxv, series=series, height=34, spark=True)
+        self.append(self.spark)
+        click = Gtk.GestureClick()
+        click.connect("released", lambda *_: on_pick())
+        self.add_controller(click)
+        self.set_cursor(Gdk.Cursor.new_from_name("pointer"))
+
+    def set_selected(self, on):
+        (self.add_css_class if on else self.remove_css_class)("selected")
+
+class PerfDetail(Gtk.Box):
+
+    def __init__(self, title, subtitle, graph, stat_keys, legend=None):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        self.add_css_class("card")
+        self.set_hexpand(True)
+        self.set_vexpand(True)
+
+        head = ui.box(False, 12)
+        titles = ui.box(True, 2, hexpand=True)
+        titles.append(ui.label(title, "page-title"))
+        titles.append(ui.label(subtitle, "page-sub", ellipsize=True))
+        head.append(titles)
+        self.value = ui.label("–", "big-value", "mono", xalign=1, valign=Gtk.Align.START)
+        head.append(self.value)
+        self.append(head)
+
+        self.graph = graph
+        graph.set_vexpand(True)
+        self.append(graph)
+        if legend:
+            row = ui.box(False, 16)
+            for text, shade in legend:
+                dot = Gtk.DrawingArea(content_width=10, content_height=10, valign=Gtk.Align.CENTER)
+                dot.set_draw_func(lambda _a, cr, w, h, s=shade: (cr.set_source_rgba(s, s, s, 1),
+                                                                cr.arc(w / 2, h / 2, w / 2, 0, 2 * math.pi), cr.fill()))
+                row.append(ui.box(False, 8, dot, ui.label(text, "dim")))
+            self.append(row)
+
+        grid = Gtk.Grid(column_spacing=10, row_spacing=10, column_homogeneous=True)
+        self.stats = {}
+        for i, key in enumerate(stat_keys):
+            v = ui.label("–", "stat-val", "mono", ellipsize=True)
+            cell = ui.box(True, 2, ui.label(key.upper(), "stat-key"), v, hexpand=True)
+            cell.add_css_class("stat")
+            grid.attach(cell, i % 3, i // 3, 1, 1)
+            self.stats[key] = v
+        self.append(grid)
+
+    def set(self, value, **stats):
+        self.value.set_text(value)
+        for k, v in stats.items():
+            self.stats[k.replace("_", " ")].set_text(v)
+
+class TaskManager(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="Task Manager")
+        self.set_default_size(1080, 700)
+
+        self.items = {}
+        self.search = ""
+        self.only_mine = True
+        self.handlers = {}
+        self.icons = app_icons()
+        self.fallback_icon = Gio.ThemedIcon.new("application-x-executable-symbolic")
+
+        self.gpu_dev, self.gpu_name = find_gpu()
+        self.gpu_hwmon = next(iter(glob.glob(f"{self.gpu_dev}/hwmon/hwmon*")), None) if self.gpu_dev else None
+        self.net_last = psutil.net_io_counters()
+        self.net_time = time.monotonic()
+        psutil.cpu_percent(None)
+
+        self.frame = ui.Frame(self, "Task Manager", [
+            ("processes", "Processes", "view-list-symbolic"),
+            ("performance", "Performance", "power-profile-performance-symbolic"),
+        ])
+        self.frame.set_page("processes", self._build_processes())
+        self.frame.set_page("performance", self._build_performance())
+        self._build_footer()
+        self.frame.show("processes")
+
+        keys = Gtk.EventControllerKey()
+        keys.connect("key-pressed", self._on_key)
+        self.add_controller(keys)
+
+        self._tick()
+        GLib.timeout_add(TICK_MS, self._tick)
+
+    def _build_footer(self):
+        self.meters = {}
+        for key, title in (("cpu", "CPU"), ("mem", "Memory")):
+            value = ui.label("–", "dim", "mono", xalign=1)
+            bar = Gtk.ProgressBar(fraction=0)
+            self.frame.footer.append(ui.box(True, 6, ui.box(False, 0, ui.label(title, hexpand=True), value), bar))
+            self.meters[key] = (value, bar)
+        self.frame.footer.set_visible(True)
+
+    def _build_processes(self):
+        page = ui.Page("Processes")
+        self.proc_page = page
+        self.kill_btn = ui.button("Force kill", None, "soft", "danger", tooltip="Kill immediately (Shift+Delete)",
+                                  on_click=lambda: self._end_selected(force=True))
+        self.end_btn = ui.button("End task", None, "primary", tooltip="Ask the app to close (Delete)",
+                                 on_click=lambda: self._end_selected(force=False))
+        self.kill_btn.set_sensitive(False)
+        self.end_btn.set_sensitive(False)
+        page.actions.append(self.kill_btn)
+        page.actions.append(self.end_btn)
+
+        bar = ui.box(False, 10)
+        self.entry = Gtk.SearchEntry(placeholder_text="Search name or PID", hexpand=True)
+        self.entry.connect("search-changed", self._on_search)
+        bar.append(ui.smooth(self.entry))
+        mine = Gtk.ToggleButton(label="My processes", active=True)
+        every = Gtk.ToggleButton(label="All", group=mine)
+        for t in (mine, every):
+            t.add_css_class("filter")
+            t.set_valign(Gtk.Align.CENTER)
+            bar.append(t)
+        mine.connect("toggled", self._on_only_mine)
+        bar.append(self._build_sort_button())
+        page.body.append(bar)
+
+        self.store = Gio.ListStore(item_type=ProcItem)
+        self.filter = Gtk.CustomFilter.new(self._filter_func)
+        filtered = Gtk.FilterListModel(model=self.store, filter=self.filter)
+        self.cv = Gtk.ColumnView(show_row_separators=False, show_column_separators=False, reorderable=False)
+        sorted_model = Gtk.SortListModel(model=filtered, sorter=self.cv.get_sorter())
+        self.sel = Gtk.SingleSelection(model=sorted_model, autoselect=False, can_unselect=True)
+        self.sel.connect("notify::selected-item", self._on_selection)
+        self.cv.set_model(self.sel)
+
+        def txt(attr):
+            return lambda a, b: GLib.utf8_collate(a.get_property(attr).lower(), b.get_property(attr).lower())
+
+        def num(attr):
+            return lambda a, b: (a.get_property(attr) > b.get_property(attr)) - (a.get_property(attr) < b.get_property(attr))
+
+        self.sorters = []
+        self.columns = {
+            "name": self._add_column("NAME", self._name_cell, txt("name"), expand=True),
+            "cpu": self._add_column("CPU", self._cpu_cell, num("cpu"), width=130),
+            "mem": self._add_column("MEMORY", self._text_cell(lambda i: fmt_bytes(i.mem), 1), num("mem"), width=120),
+            "pid": self._add_column("PID", self._text_cell(lambda i: str(i.pid), 1, dim=True), num("pid"), width=90),
+            "threads": self._add_column("THREADS", self._text_cell(lambda i: str(i.threads), 1, dim=True), num("threads"), width=100),
+            "user": self._add_column("USER", self._text_cell(lambda i: i.user, 0, dim=True), txt("user"), width=140),
+        }
+        self._sort_by(SORT_PRESETS[0])
+        self.cv.get_sorter().connect("changed", lambda *_: self._sync_sort_label())
+
+        scroll = Gtk.ScrolledWindow(child=self.cv, vexpand=True)
+        self.vadj = scroll.get_vadjustment()
+        list_card = ui.card(scroll, "flush")
+        list_card.set_overflow(Gtk.Overflow.HIDDEN)
+        list_card.set_vexpand(True)
+        page.body.append(list_card)
+        return page
+
+    def _build_sort_button(self):
+        self.sort_label = ui.label("", xalign=0)
+        content = ui.box(False, 8, Gtk.Image(icon_name="view-sort-descending-symbolic"), self.sort_label,
+                         Gtk.Image(icon_name="pan-down-symbolic"))
+        self.sort_btn = Gtk.MenuButton(child=content, valign=Gtk.Align.CENTER, tooltip_text="Sort processes")
+        self.sort_btn.add_css_class("soft")
+
+        box = ui.box(True, 2, margin_top=6, margin_bottom=6, margin_start=6, margin_end=6)
+        self.sort_rows = {}
+        group = None
+        for section, presets in (("CPU", SORT_PRESETS[0:2]), ("Memory", SORT_PRESETS[2:4]),
+                                 ("Name", SORT_PRESETS[4:6]), ("Other", SORT_PRESETS[6:])):
+            box.append(ui.label(section.upper(), "stat-key", margin_start=10, margin_top=6, margin_bottom=2))
+            for preset in presets:
+                check = Gtk.CheckButton(group=group)
+                group = group or check
+                row = Gtk.Button(child=ui.box(False, 10, check, ui.label(preset[0], hexpand=True)))
+                row.add_css_class("flat")
+                row.add_css_class("menu-row")
+                row.connect("clicked", lambda _b, pr=preset: (self._sort_by(pr), self.sort_btn.popdown()))
+                box.append(row)
+                self.sort_rows[preset] = check
+        pop = Gtk.Popover(child=box, has_arrow=False)
+        pop.set_position(Gtk.PositionType.BOTTOM)
+        self.sort_btn.set_popover(pop)
+        return self.sort_btn
+
+    def _sort_by(self, preset):
+        _title, key, descending = preset
+        self.cv.sort_by_column(None, Gtk.SortType.ASCENDING)
+        self.cv.sort_by_column(self.columns[key], Gtk.SortType.DESCENDING if descending else Gtk.SortType.ASCENDING)
+        self._sync_sort_label()
+        def to_top():
+            if self.sel.get_n_items():
+                self.cv.scroll_to(0, None, Gtk.ListScrollFlags.NONE, None)
+            return False
+        if getattr(self, "vadj", None):
+            GLib.timeout_add(80, to_top)
+
+    def _sync_sort_label(self):
+        sorter = self.cv.get_sorter()
+        col, order = sorter.get_primary_sort_column(), sorter.get_primary_sort_order()
+        key = next((k for k, c in self.columns.items() if c == col), None)
+        descending = order == Gtk.SortType.DESCENDING
+        preset = next((pr for pr in SORT_PRESETS if pr[1] == key and pr[2] == descending), None)
+        if hasattr(self, "sort_label"):
+            self.sort_label.set_text(preset[0] if preset else "Sort")
+            if preset in getattr(self, "sort_rows", {}):
+                self.sort_rows[preset].set_active(True)
+
+    def _name_cell(self):
+        def setup(li):
+            img = Gtk.Image(pixel_size=22)
+            lbl = ui.label("", ellipsize=True, hexpand=True)
+            li.set_child(ui.box(False, 12, img, lbl, margin_start=10, margin_end=10))
+
+        def update(li, item):
+            img, lbl = li.get_child().get_first_child(), li.get_child().get_last_child()
+            img.set_from_gicon(item.icon or self.fallback_icon)
+            img.set_opacity(1.0 if item.icon else 0.45)
+            lbl.set_text(item.name)
+        return setup, update
+
+    def _cpu_cell(self):
+        def setup(li):
+            bar = Bar()
+            lbl = ui.label("", "mono", xalign=1, hexpand=True)
+            li.set_child(ui.box(False, 10, bar, lbl, margin_start=10, margin_end=10))
+
+        def update(li, item):
+            bar, lbl = li.get_child().get_first_child(), li.get_child().get_last_child()
+            bar.set(item.cpu / 100 * 4)
+            lbl.set_text(f"{item.cpu:.1f}%")
+            lbl.set_opacity(1.0 if item.cpu >= 0.1 else 0.4)
+        return setup, update
+
+    def _text_cell(self, getter, xalign, dim=False):
+        def make():
+            def setup(li):
+                lbl = ui.label("", "mono", xalign=xalign, ellipsize=True, margin_start=10, margin_end=10)
+                if dim:
+                    lbl.add_css_class("dim")
+                li.set_child(lbl)
+
+            def update(li, item):
+                li.get_child().set_text(getter(item))
+            return setup, update
+        return make
+
+    def _add_column(self, title, cell, cmp, expand=False, width=None):
+        setup_cell, update_cell = cell()
+        factory = Gtk.SignalListItemFactory()
+        factory.connect("setup", lambda _f, li: setup_cell(li))
+
+        def bind(_f, li):
+            item = li.get_item()
+            update_cell(li, item)
+            self.handlers[(li, title)] = (item, item.connect("notify", lambda *_: update_cell(li, item)))
+
+        def unbind(_f, li):
+            item, hid = self.handlers.pop((li, title), (None, None))
+            if item is not None:
+                item.disconnect(hid)
+
+        factory.connect("bind", bind)
+        factory.connect("unbind", unbind)
+
+        def ordering(a, b, *_):
+            c = cmp(a, b)
+            return Gtk.Ordering.SMALLER if c < 0 else Gtk.Ordering.LARGER if c > 0 else Gtk.Ordering.EQUAL
+
+        sorter = Gtk.CustomSorter.new(ordering)
+        self.sorters.append(sorter)
+        col = Gtk.ColumnViewColumn(title=title, factory=factory, sorter=sorter, expand=expand, resizable=True)
+        if width:
+            col.set_fixed_width(width)
+        self.cv.append_column(col)
+        return col
+
+    def _filter_func(self, item, *_):
+        if self.only_mine and item.uid != MY_UID:
+            return False
+        if self.search:
+            return self.search in item.name.lower() or self.search == str(item.pid)
+        return True
+
+    def _on_search(self, entry):
+        self.search = entry.get_text().strip().lower()
+        self.filter.changed(Gtk.FilterChange.DIFFERENT)
+
+    def _on_only_mine(self, btn):
+        self.only_mine = btn.get_active()
+        self.filter.changed(Gtk.FilterChange.DIFFERENT)
+
+    def _on_selection(self, *_):
+        has = self.sel.get_selected_item() is not None
+        self.end_btn.set_sensitive(has)
+        self.kill_btn.set_sensitive(has)
+
+    def _end_selected(self, force):
+        item = self.sel.get_selected_item()
+        if item is None:
+            return
+        try:
+            os.kill(item.pid, signal.SIGKILL if force else signal.SIGTERM)
+            self.frame.toast(f"{'Killed' if force else 'Ended'} {item.name}", 2)
+        except ProcessLookupError:
+            self.frame.toast(f"{item.name} already exited", 2)
+        except PermissionError:
+            self.frame.toast(f"No permission to end {item.name} (owned by {item.user})")
+
+    def _on_key(self, _ctl, keyval, _code, state):
+        ctrl = state & Gdk.ModifierType.CONTROL_MASK
+        if keyval == Gdk.KEY_Delete:
+            self._end_selected(force=bool(state & Gdk.ModifierType.SHIFT_MASK))
+            return True
+        if ctrl and keyval == Gdk.KEY_f:
+            self.frame.show("processes")
+            self.entry.grab_focus()
+            return True
+        if keyval == Gdk.KEY_Escape and not self.entry.has_focus():
+            self.close()
+            return True
+        if ctrl and keyval in (Gdk.KEY_w, Gdk.KEY_q):
+            self.close()
+            return True
+        return False
+
+    def _build_performance(self):
+        page = ui.Page("Performance", "Live for the last minute")
+        row = ui.box(False, 14, vexpand=True)
+
+        self.details = {
+            "cpu": PerfDetail("CPU", cpu_model(), Graph(100), ["Speed", "Temp", "Cores", "Processes", "Threads", "Uptime"]),
+            "gpu": PerfDetail("GPU", self.gpu_name or "Not detected", Graph(100), ["VRAM", "Temp", "Power", "Fan", "Clock"]),
+            "mem": PerfDetail("Memory", fmt_bytes(psutil.virtual_memory().total) + " installed", Graph(100),
+                              ["In use", "Available", "Cached", "Swap"]),
+            "net": PerfDetail("Network", "All interfaces", Graph(None, series=2), ["Download", "Upload", "Received", "Sent"],
+                              legend=[("Download", 0.95), ("Upload", 0.55)]),
+        }
+        self.detail_stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE, transition_duration=200,
+                                      hexpand=True, vexpand=True)
+        for key, d in self.details.items():
+            self.detail_stack.add_named(d, key)
+
+        tiles = ui.box(True, 10)
+        tiles.set_size_request(240, -1)
+        self.tiles = {}
+        for key, title in (("cpu", "CPU"), ("gpu", "GPU"), ("mem", "Memory"), ("net", "Network")):
+            t = PerfTile(title, lambda k=key: self._pick_perf(k), series=2 if key == "net" else 1,
+                         maxv=None if key == "net" else 100.0)
+            tiles.append(t)
+            self.tiles[key] = t
+        row.append(tiles)
+        row.append(self.detail_stack)
+        page.body.append(row)
+        self._pick_perf("cpu")
+        return page
+
+    def _pick_perf(self, key):
+        for k, t in self.tiles.items():
+            t.set_selected(k == key)
+        self.detail_stack.set_visible_child_name(key)
+
+    def _tick(self):
+        self.cpu_now = psutil.cpu_percent(None)
+        self._refresh_processes()
+        self._refresh_performance()
+        return GLib.SOURCE_CONTINUE
+
+    def _icon_for(self, name, cmd):
+        base = name.lower()
+        keys = [base, re.sub(r"(-bin|-wrapped|-stable|_crashpad.*|\.real)$", "", base)]
+        if cmd and cmd[0].startswith("/"):
+            keys += [os.path.basename(cmd[0]).lower(), os.path.basename(os.path.dirname(cmd[0])).lower()]
+        for k in keys:
+            if k in self.icons:
+                return self.icons[k]
+        return None
+
+    def _refresh_processes(self):
+        seen = set()
+        total_threads = 0
+        for p in psutil.process_iter(["pid", "name", "uids", "username", "memory_info", "num_threads", "cmdline"]):
+            info = p.info
+            pid = info["pid"]
+            seen.add(pid)
+            try:
+                cpu = p.cpu_percent(None) / NCPU
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                cpu = 0.0
+            total_threads += info["num_threads"] or 0
+
+            entry = self.items.get(pid)
+            if entry is None:
+                name = info["name"] or "?"
+                cmd = info["cmdline"] or []
+                if len(name) == 15 and cmd:
+                    base = os.path.basename(cmd[0])
+                    if base.startswith(name):
+                        name = base
+                item = ProcItem(name=name, pid=pid,
+                                uid=info["uids"].real if info["uids"] else -1,
+                                user=info["username"] or "?", icon=self._icon_for(name, cmd))
+                self.items[pid] = (p, item)
+                self.store.append(item)
+            else:
+                item = entry[1]
+
+            cpu = round(cpu, 1)
+            mem = float(info["memory_info"].rss) if info["memory_info"] else 0.0
+            if item.cpu != cpu:
+                item.cpu = cpu
+            if item.mem != mem:
+                item.mem = mem
+            if item.threads != (info["num_threads"] or 0):
+                item.threads = info["num_threads"] or 0
+
+        for pid in [pid for pid in self.items if pid not in seen]:
+            _, item = self.items.pop(pid)
+            found, pos = self.store.find(item)
+            if found:
+                self.store.remove(pos)
+
+        at_top = self.vadj.get_value() < 4
+        for s in self.sorters:
+            s.changed(Gtk.SorterChange.DIFFERENT)
+        if at_top:
+            GLib.idle_add(lambda: self.vadj.set_value(0) and False)
+
+        self.total_threads = total_threads
+        vm = psutil.virtual_memory()
+        self.proc_page.set_subtitle(f"{len(self.items)} running  ·  CPU {self.cpu_now:.0f}%  ·  "
+                                    f"Memory {fmt_bytes(vm.used)} of {fmt_bytes(vm.total)}")
+        for key, frac, text in (("cpu", self.cpu_now / 100, f"{self.cpu_now:.0f}%"),
+                                ("mem", vm.percent / 100, f"{vm.percent:.0f}%")):
+            value, bar = self.meters[key]
+            value.set_text(text)
+            bar.set_fraction(frac)
+
+    def _refresh_performance(self):
+        def show(key, value, primary, *series, **stats):
+            self.details[key].graph.push(*series)
+            self.details[key].set(value, **stats)
+            self.tiles[key].spark.push(*series)
+            self.tiles[key].value.set_text(primary)
+
+        cpu = self.cpu_now
+        freq = psutil.cpu_freq()
+        temps = psutil.sensors_temperatures()
+        ctemp = next((t.current for t in temps.get("k10temp", []) + temps.get("coretemp", [])
+                      if t.label in ("Tctl", "Package id 0", "")), None)
+        up = int(time.time() - psutil.boot_time())
+        show("cpu", f"{cpu:.0f}%", f"{cpu:.0f}%", cpu,
+             Speed=f"{freq.current / 1000:.2f} GHz" if freq else "–",
+             Temp=f"{ctemp:.0f} °C" if ctemp is not None else "–",
+             Cores=f"{psutil.cpu_count(False)} · {NCPU} threads",
+             Processes=str(len(self.items)),
+             Threads=str(getattr(self, "total_threads", 0)),
+             Uptime=(f"{up // 86400}d " if up >= 86400 else "") + f"{up % 86400 // 3600}h {up % 3600 // 60}m")
+
+        vm, sw = psutil.virtual_memory(), psutil.swap_memory()
+        show("mem", f"{vm.percent:.0f}%", f"{fmt_bytes(vm.used)}", vm.percent,
+             In_use=fmt_bytes(vm.used), Available=fmt_bytes(vm.available),
+             Cached=fmt_bytes(getattr(vm, "cached", 0)),
+             Swap=f"{fmt_bytes(sw.used)} / {fmt_bytes(sw.total)}")
+
+        if self.gpu_dev:
+            busy = read(f"{self.gpu_dev}/gpu_busy_percent", int, 0)
+            used = read(f"{self.gpu_dev}/mem_info_vram_used", int, 0)
+            total = read(f"{self.gpu_dev}/mem_info_vram_total", int, 1)
+            hw = self.gpu_hwmon
+            temp = read(f"{hw}/temp1_input", int) if hw else None
+            power = read(f"{hw}/power1_average", int) or read(f"{hw}/power1_input", int) if hw else None
+            fan = read(f"{hw}/fan1_input", int) if hw else None
+            clock = read(f"{hw}/freq1_input", int) if hw else None
+            show("gpu", f"{busy}%", f"{busy}%", busy,
+                 VRAM=f"{used / 2**30:.1f} / {total / 2**30:.0f} GB",
+                 Temp=f"{temp / 1000:.0f} °C" if temp else "–",
+                 Power=f"{power / 1e6:.0f} W" if power else "–",
+                 Fan=f"{fan} RPM" if fan is not None else "–",
+                 Clock=f"{clock / 1e6:.0f} MHz" if clock is not None else "–")
+
+        now, io = time.monotonic(), psutil.net_io_counters()
+        dt = max(now - self.net_time, 1e-3)
+        down = (io.bytes_recv - self.net_last.bytes_recv) / dt
+        upl = (io.bytes_sent - self.net_last.bytes_sent) / dt
+        self.net_last, self.net_time = io, now
+        show("net", fmt_rate(down), f"↓ {fmt_rate(down)}", down, upl,
+             Download=fmt_rate(down), Upload=fmt_rate(upl),
+             Received=fmt_bytes(io.bytes_recv), Sent=fmt_bytes(io.bytes_sent))
+
+class App(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+
+    def do_startup(self):
+        Adw.Application.do_startup(self)
+        ui.install()
+
+    def do_activate(self):
+        win = self.get_active_window() or TaskManager(self)
+        if "--performance" in sys.argv:
+            win.frame.show("performance")
+        win.present()
+
+if __name__ == "__main__":
+    App().run([sys.argv[0]])
